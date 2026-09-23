@@ -67,6 +67,31 @@ novo ETag. Um replay conserva status HTTP, corpo e ETag da resposta original,
 mesmo que a Task já tenha avançado. O cabeçalho `Idempotency-Replayed` apenas
 indica se a resposta veio do registro idempotente.
 
+## Approval e reação explícita
+
+O primeiro fluxo humano no loop mantém decisão e reação em comandos separados:
+
+```text
+POST /tasks/{id}/request-approval   Task ready → waiting_approval
+POST /approvals/{id}/approve       Approval pending → approved
+POST /approvals/{id}/reject        Approval pending → rejected
+POST /tasks/{id}/release           Task waiting_approval → ready
+```
+
+Decidir uma Approval nunca altera a Task. `release` precisa indicar uma
+`approval_id` específica, aprovada, pertencente à mesma Task e correlação. Uma
+Approval rejeitada deixa a Task em `waiting_approval`; nenhuma política de
+workflow é inferida.
+
+`request-approval` retorna as representações de Task e Approval juntas, com
+`Task-ETag` e `Approval-ETag`. Decisões retornam a Approval e seu ETag; `release`
+retorna a Task e seu ETag. Todos os quatro comandos exigem `If-Match` e
+`Idempotency-Key`.
+
+As identidades `requested_by`, `decided_by` e `actor_id` são autodeclaradas no
+MVP. Elas definem autoria e escopo idempotente, mas não representam autenticação
+ou autorização verificadas.
+
 ## Testes
 
 ```bash
