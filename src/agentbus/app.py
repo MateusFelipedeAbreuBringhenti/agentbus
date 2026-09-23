@@ -10,20 +10,44 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from agentbus.database import Database
-from agentbus.models import EventRead, TaskClaim, TaskComplete, TaskCreate, TaskFail, TaskRead
+from agentbus.models import (
+    ApprovalDecision,
+    ApprovalRead,
+    ApprovalStatus,
+    EventRead,
+    RequestApproval,
+    RequestApprovalResult,
+    TaskClaim,
+    TaskComplete,
+    TaskCreate,
+    TaskFail,
+    TaskRead,
+    TaskRelease,
+)
 from agentbus.service import (
+    ApprovalCorrelationMismatch,
+    ApprovalNotFound,
+    ApprovalStateConflict,
+    ApprovalTaskMismatch,
+    ApprovalVersionConflict,
     CausationCorrelationMismatch,
     CausationEventNotFound,
     IdempotencyConflict,
+    PendingApprovalConflict,
     TaskNotFound,
     TaskStateConflict,
     TaskVersionConflict,
     claim_task,
     complete_task,
     create_task,
+    decide_approval,
     fail_task,
+    get_approval,
     get_task,
+    get_task_approvals,
     get_task_events,
+    release_task,
+    request_task_approval,
 )
 
 
@@ -47,6 +71,36 @@ def _task_response(
         status_code=status_code,
         content=task.model_dump(mode="json"),
         headers=headers,
+    )
+
+
+def _approval_response(
+    approval: ApprovalRead,
+    *,
+    replayed: bool | None = None,
+) -> JSONResponse:
+    headers = {"ETag": f'"v{approval.version}"'}
+    if replayed is not None:
+        headers["Idempotency-Replayed"] = str(replayed).lower()
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=approval.model_dump(mode="json"),
+        headers=headers,
+    )
+
+
+def _request_approval_response(
+    result: RequestApprovalResult,
+    replayed: bool,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=result.model_dump(mode="json"),
+        headers={
+            "Task-ETag": f'"v{result.task.version}"',
+            "Approval-ETag": f'"v{result.approval.version}"',
+            "Idempotency-Replayed": str(replayed).lower(),
+        },
     )
 
 
@@ -169,6 +223,94 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             },
         )
 
+    @app.exception_handler(ApprovalNotFound)
+    async def approval_not_found_handler(_: Request, __: ApprovalNotFound) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "detail": {"code": "approval_not_found", "message": "Approval not found."}
+            },
+        )
+
+    @app.exception_handler(ApprovalStateConflict)
+    async def approval_state_conflict_handler(
+        _: Request,
+        error: ApprovalStateConflict,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "approval_state_conflict",
+                    "message": "Approval is not in the state required by this command.",
+                    "expected": error.expected.value,
+                    "actual": error.actual.value,
+                }
+            },
+        )
+
+    @app.exception_handler(ApprovalVersionConflict)
+    async def approval_version_conflict_handler(
+        _: Request,
+        error: ApprovalVersionConflict,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "approval_version_conflict",
+                    "message": "Approval version differs from If-Match.",
+                    "expected": error.expected,
+                    "actual": error.actual,
+                }
+            },
+        )
+
+    @app.exception_handler(ApprovalTaskMismatch)
+    async def approval_task_mismatch_handler(
+        _: Request,
+        __: ApprovalTaskMismatch,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "approval_task_mismatch",
+                    "message": "Approval belongs to another Task.",
+                }
+            },
+        )
+
+    @app.exception_handler(ApprovalCorrelationMismatch)
+    async def approval_correlation_mismatch_handler(
+        _: Request,
+        __: ApprovalCorrelationMismatch,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "approval_correlation_mismatch",
+                    "message": "Approval belongs to another correlation.",
+                }
+            },
+        )
+
+    @app.exception_handler(PendingApprovalConflict)
+    async def pending_approval_conflict_handler(
+        _: Request,
+        __: PendingApprovalConflict,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "pending_approval_conflict",
+                    "message": "A pending Approval already exists for this Task and gate.",
+                }
+            },
+        )
+
     @app.exception_handler(sqlite3.DatabaseError)
     async def database_error_handler(_: Request, __: sqlite3.DatabaseError) -> JSONResponse:
         return JSONResponse(
@@ -263,6 +405,106 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             status_code=status.HTTP_200_OK,
             replayed=result.replayed,
         )
+
+    @app.post("/tasks/{task_id}/request-approval", response_model=RequestApprovalResult)
+    def request_task_approval_endpoint(
+        task_id: UUID,
+        command: RequestApproval,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=200,
+        ),
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> JSONResponse:
+        result = request_task_approval(
+            database,
+            task_id,
+            command,
+            idempotency_key,
+            _expected_version(if_match),
+        )
+        return _request_approval_response(result.result, result.replayed)
+
+    @app.post("/approvals/{approval_id}/approve", response_model=ApprovalRead)
+    def approve_approval_endpoint(
+        approval_id: UUID,
+        command: ApprovalDecision,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=200,
+        ),
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> JSONResponse:
+        result = decide_approval(
+            database,
+            approval_id,
+            command,
+            idempotency_key,
+            _expected_version(if_match),
+            ApprovalStatus.APPROVED,
+        )
+        return _approval_response(result.approval, replayed=result.replayed)
+
+    @app.post("/approvals/{approval_id}/reject", response_model=ApprovalRead)
+    def reject_approval_endpoint(
+        approval_id: UUID,
+        command: ApprovalDecision,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=200,
+        ),
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> JSONResponse:
+        result = decide_approval(
+            database,
+            approval_id,
+            command,
+            idempotency_key,
+            _expected_version(if_match),
+            ApprovalStatus.REJECTED,
+        )
+        return _approval_response(result.approval, replayed=result.replayed)
+
+    @app.post("/tasks/{task_id}/release", response_model=TaskRead)
+    def release_task_endpoint(
+        task_id: UUID,
+        command: TaskRelease,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=200,
+        ),
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> JSONResponse:
+        result = release_task(
+            database,
+            task_id,
+            command,
+            idempotency_key,
+            _expected_version(if_match),
+        )
+        return _task_response(
+            result.task,
+            status_code=status.HTTP_200_OK,
+            replayed=result.replayed,
+        )
+
+    @app.get("/approvals/{approval_id}", response_model=ApprovalRead)
+    def get_approval_endpoint(approval_id: UUID) -> JSONResponse:
+        approval = get_approval(database, approval_id)
+        if approval is None:
+            raise ApprovalNotFound
+        return _approval_response(approval)
+
+    @app.get("/tasks/{task_id}/approvals", response_model=list[ApprovalRead])
+    def get_task_approvals_endpoint(task_id: UUID) -> list[ApprovalRead]:
+        task = get_task(database, task_id)
+        if task is None:
+            raise TaskNotFound
+        return get_task_approvals(database, task_id)
 
     @app.get("/tasks/{task_id}/events", response_model=list[EventRead])
     def get_task_events_endpoint(task_id: UUID) -> list[EventRead]:
