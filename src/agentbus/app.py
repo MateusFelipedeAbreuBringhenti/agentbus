@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import os
 from pathlib import Path
+import re
 import sqlite3
 from uuid import UUID
 
@@ -9,15 +10,65 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from agentbus.database import Database
-from agentbus.models import EventRead, TaskCreate, TaskRead
+from agentbus.models import EventRead, TaskClaim, TaskComplete, TaskCreate, TaskFail, TaskRead
 from agentbus.service import (
     CausationCorrelationMismatch,
     CausationEventNotFound,
     IdempotencyConflict,
+    TaskNotFound,
+    TaskStateConflict,
+    TaskVersionConflict,
+    claim_task,
+    complete_task,
     create_task,
+    fail_task,
     get_task,
     get_task_events,
 )
+
+
+ETAG_PATTERN = re.compile(r'^"v([1-9][0-9]*)"$')
+
+
+def _etag(task: TaskRead) -> str:
+    return f'"v{task.version}"'
+
+
+def _task_response(
+    task: TaskRead,
+    *,
+    status_code: int,
+    replayed: bool | None = None,
+) -> JSONResponse:
+    headers = {"ETag": _etag(task)}
+    if replayed is not None:
+        headers["Idempotency-Replayed"] = str(replayed).lower()
+    return JSONResponse(
+        status_code=status_code,
+        content=task.model_dump(mode="json"),
+        headers=headers,
+    )
+
+
+def _expected_version(if_match: str | None) -> int:
+    if if_match is None:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail={
+                "code": "if_match_required",
+                "message": "If-Match is required for this command.",
+            },
+        )
+    matched = ETAG_PATTERN.fullmatch(if_match)
+    if matched is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_if_match",
+                "message": 'If-Match must be a strong ETag in the form "vN".',
+            },
+        )
+    return int(matched.group(1))
 
 
 def create_app(database_path: str | Path | None = None) -> FastAPI:
@@ -77,6 +128,47 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             },
         )
 
+    @app.exception_handler(TaskNotFound)
+    async def task_not_found_handler(_: Request, __: TaskNotFound) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": {"code": "task_not_found", "message": "Task not found."}},
+        )
+
+    @app.exception_handler(TaskStateConflict)
+    async def task_state_conflict_handler(
+        _: Request,
+        error: TaskStateConflict,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "task_state_conflict",
+                    "message": "Task is not in the state required by this command.",
+                    "expected": error.expected.value,
+                    "actual": error.actual.value,
+                }
+            },
+        )
+
+    @app.exception_handler(TaskVersionConflict)
+    async def task_version_conflict_handler(
+        _: Request,
+        error: TaskVersionConflict,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "task_version_conflict",
+                    "message": "Task version differs from If-Match.",
+                    "expected": error.expected,
+                    "actual": error.actual,
+                }
+            },
+        )
+
     @app.exception_handler(sqlite3.DatabaseError)
     async def database_error_handler(_: Request, __: sqlite3.DatabaseError) -> JSONResponse:
         return JSONResponse(
@@ -94,18 +186,83 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         ),
     ) -> JSONResponse:
         result = create_task(database, task, idempotency_key)
-        return JSONResponse(
+        return _task_response(
+            result.task,
             status_code=status.HTTP_201_CREATED,
-            content=result.task.model_dump(mode="json"),
-            headers={"Idempotency-Replayed": str(result.replayed).lower()},
+            replayed=result.replayed,
         )
 
     @app.get("/tasks/{task_id}", response_model=TaskRead)
-    def get_task_endpoint(task_id: UUID) -> TaskRead:
+    def get_task_endpoint(task_id: UUID) -> JSONResponse:
         task = get_task(database, task_id)
         if task is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
-        return task
+        return _task_response(task, status_code=status.HTTP_200_OK)
+
+    @app.post("/tasks/{task_id}/claim", response_model=TaskRead)
+    def claim_task_endpoint(
+        task_id: UUID,
+        command: TaskClaim,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=200,
+        ),
+    ) -> JSONResponse:
+        result = claim_task(database, task_id, command, idempotency_key)
+        return _task_response(
+            result.task,
+            status_code=status.HTTP_200_OK,
+            replayed=result.replayed,
+        )
+
+    @app.post("/tasks/{task_id}/complete", response_model=TaskRead)
+    def complete_task_endpoint(
+        task_id: UUID,
+        command: TaskComplete,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=200,
+        ),
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> JSONResponse:
+        result = complete_task(
+            database,
+            task_id,
+            command,
+            idempotency_key,
+            _expected_version(if_match),
+        )
+        return _task_response(
+            result.task,
+            status_code=status.HTTP_200_OK,
+            replayed=result.replayed,
+        )
+
+    @app.post("/tasks/{task_id}/fail", response_model=TaskRead)
+    def fail_task_endpoint(
+        task_id: UUID,
+        command: TaskFail,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=200,
+        ),
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> JSONResponse:
+        result = fail_task(
+            database,
+            task_id,
+            command,
+            idempotency_key,
+            _expected_version(if_match),
+        )
+        return _task_response(
+            result.task,
+            status_code=status.HTTP_200_OK,
+            replayed=result.replayed,
+        )
 
     @app.get("/tasks/{task_id}/events", response_model=list[EventRead])
     def get_task_events_endpoint(task_id: UUID) -> list[EventRead]:
