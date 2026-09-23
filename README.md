@@ -1,5 +1,7 @@
 # AgentBus
 
+`localhost://revolution` — multi-agent orchestration with a human in the loop.
+
 Primeiro slice vertical do AgentBus: criação e consulta de `Task`, auditoria por
 `Event` append-only e replay idempotente em SQLite.
 
