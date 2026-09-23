@@ -96,6 +96,21 @@ def test_same_key_with_different_body_returns_conflict(client, correlation_id):
     assert conflict.json()["detail"]["code"] == "idempotency_key_reused"
 
 
+def test_different_requesters_can_reuse_same_idempotency_key(client, correlation_id):
+    headers = {"Idempotency-Key": "shared-between-identities"}
+    orion_payload = task_payload(correlation_id)
+    dex_payload = {**orion_payload, "requested_by": "dex"}
+
+    orion_response = client.post("/tasks", json=orion_payload, headers=headers)
+    dex_response = client.post("/tasks", json=dex_payload, headers=headers)
+
+    assert orion_response.status_code == 201
+    assert dex_response.status_code == 201
+    assert orion_response.json()["id"] != dex_response.json()["id"]
+    assert orion_response.json()["requested_by"] == "orion"
+    assert dex_response.json()["requested_by"] == "dex"
+
+
 def test_event_failure_rolls_back_task_event_and_idempotency(
     client,
     database_path,
@@ -131,4 +146,3 @@ def test_event_failure_rolls_back_task_event_and_idempotency(
     assert task_count == 0
     assert event_count == 0
     assert idempotency_count == 0
-

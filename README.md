@@ -27,6 +27,10 @@ curl -X POST http://localhost:8000/tasks \
   }'
 ```
 
+No MVP, o escopo da chave idempotente combina a operação com `requested_by`.
+Como ainda não existe autenticação, essa identidade é declarada pelo próprio
+cliente e não deve ser tratada como identidade verificada ou autorização.
+
 ## Testes
 
 ```bash

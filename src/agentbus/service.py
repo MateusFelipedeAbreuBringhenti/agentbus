@@ -10,7 +10,7 @@ from agentbus.database import Database
 from agentbus.models import EventRead, TaskCreate, TaskRead, TaskStatus
 
 
-IDEMPOTENCY_SCOPE = "POST:/tasks"
+CREATE_TASK_OPERATION = "POST:/tasks"
 
 
 class IdempotencyConflict(Exception):
@@ -31,6 +31,15 @@ def _canonical_request_hash(request: TaskCreate) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _idempotency_scope(requested_by: str) -> str:
+    return json.dumps(
+        {"identity": requested_by, "operation": CREATE_TASK_OPERATION},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def _task_from_row(row: sqlite3.Row) -> TaskRead:
@@ -78,6 +87,7 @@ def create_task(
     idempotency_key: str,
 ) -> CreateTaskResult:
     request_hash = _canonical_request_hash(request)
+    idempotency_scope = _idempotency_scope(request.requested_by)
 
     with database.transaction() as connection:
         existing = connection.execute(
@@ -86,7 +96,7 @@ def create_task(
             FROM idempotency_records
             WHERE scope = ? AND key = ?
             """,
-            (IDEMPOTENCY_SCOPE, idempotency_key),
+            (idempotency_scope, idempotency_key),
         ).fetchone()
         if existing is not None:
             if existing["request_hash"] != request_hash:
@@ -186,7 +196,7 @@ def create_task(
             ) VALUES (?, ?, ?, ?, ?, ?, 'task', ?, 201, ?, ?)
             """,
             (
-                IDEMPOTENCY_SCOPE,
+                idempotency_scope,
                 idempotency_key,
                 request_hash,
                 str(command_id),
