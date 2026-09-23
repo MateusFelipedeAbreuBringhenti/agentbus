@@ -15,6 +15,12 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ApprovalStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
 class TaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -50,6 +56,33 @@ class TaskFail(BaseModel):
     causation_event_id: UUID | None = None
 
 
+class RequestApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    gate: str = Field(min_length=1, max_length=200)
+    request_reason: str = Field(min_length=1, max_length=10_000)
+    requested_by: str = Field(min_length=1, max_length=200)
+    assigned_to: str | None = Field(default=None, min_length=1, max_length=200)
+    context: dict[str, Any] = Field(default_factory=dict)
+    causation_event_id: UUID | None = None
+
+
+class ApprovalDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decided_by: str = Field(min_length=1, max_length=200)
+    decision_reason: str | None = Field(default=None, max_length=10_000)
+    causation_event_id: UUID | None = None
+
+
+class TaskRelease(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: UUID
+    actor_id: str = Field(min_length=1, max_length=200)
+    causation_event_id: UUID | None = None
+
+
 class TaskRead(BaseModel):
     id: UUID
     type: str
@@ -69,6 +102,29 @@ class TaskRead(BaseModel):
     updated_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+
+
+class ApprovalRead(BaseModel):
+    id: UUID
+    task_id: UUID
+    gate: str
+    status: ApprovalStatus
+    request_reason: str
+    context: dict[str, Any]
+    requested_by: str
+    assigned_to: str | None
+    decided_by: str | None
+    decision_reason: str | None
+    correlation_id: UUID
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    decided_at: datetime | None
+
+
+class RequestApprovalResult(BaseModel):
+    task: TaskRead
+    approval: ApprovalRead
 
 
 class EventRead(BaseModel):

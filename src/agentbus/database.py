@@ -4,8 +4,11 @@ from pathlib import Path
 import sqlite3
 
 
-MIGRATION_VERSION = 1
-MIGRATION_PATH = Path(__file__).resolve().parents[2] / "migrations" / "0001_initial.sql"
+MIGRATIONS_DIRECTORY = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS = (
+    (1, MIGRATIONS_DIRECTORY / "0001_initial.sql"),
+    (2, MIGRATIONS_DIRECTORY / "0002_approvals.sql"),
+)
 
 
 class Database:
@@ -28,23 +31,24 @@ class Database:
                 )
                 """
             )
-            applied = connection.execute(
-                "SELECT 1 FROM schema_migrations WHERE version = ?",
-                (MIGRATION_VERSION,),
-            ).fetchone()
-            if applied is not None:
-                return
+            for version, migration_path in MIGRATIONS:
+                applied = connection.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = ?",
+                    (version,),
+                ).fetchone()
+                if applied is not None:
+                    continue
 
-            migration = MIGRATION_PATH.read_text(encoding="utf-8")
-            connection.executescript(
-                "BEGIN IMMEDIATE;\n"
-                + migration
-                + f"""
-                INSERT INTO schema_migrations(version, applied_at)
-                VALUES ({MIGRATION_VERSION}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-                COMMIT;
-                """
-            )
+                migration = migration_path.read_text(encoding="utf-8")
+                connection.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    + migration
+                    + f"""
+                    INSERT INTO schema_migrations(version, applied_at)
+                    VALUES ({version}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+                    COMMIT;
+                    """
+                )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
