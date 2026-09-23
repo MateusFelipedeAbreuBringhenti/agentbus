@@ -139,6 +139,70 @@ def test_fail_moves_running_task_to_failed(client):
     assert events[-1]["type"] == "task.failed"
 
 
+def test_complete_replay_returns_original_response_without_new_mutation(client):
+    task = create_ready_task(client)
+    claim(client, task["id"])
+    body = {"output": {"artifact": "release.tar.gz"}}
+    headers = {"Idempotency-Key": "replay-complete", "If-Match": '"v2"'}
+
+    first = client.post(f"/tasks/{task['id']}/complete", json=body, headers=headers)
+    replay = client.post(f"/tasks/{task['id']}/complete", json=body, headers=headers)
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert first.headers["etag"] == replay.headers["etag"] == '"v3"'
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert client.get(f"/tasks/{task['id']}").json() == first.json()
+    assert len(client.get(f"/tasks/{task['id']}/events").json()) == 3
+
+
+def test_fail_replay_returns_original_response_without_new_mutation(client):
+    task = create_ready_task(client)
+    claim(client, task["id"])
+    body = {"failure_code": "execution_error", "failure_message": "Worker failed."}
+    headers = {"Idempotency-Key": "replay-fail", "If-Match": '"v2"'}
+
+    first = client.post(f"/tasks/{task['id']}/fail", json=body, headers=headers)
+    replay = client.post(f"/tasks/{task['id']}/fail", json=body, headers=headers)
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert first.headers["etag"] == replay.headers["etag"] == '"v3"'
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert client.get(f"/tasks/{task['id']}").json() == first.json()
+    assert len(client.get(f"/tasks/{task['id']}/events").json()) == 3
+
+
+def test_terminal_command_idempotency_collision_precedes_terminal_state_rejection(client):
+    task = create_ready_task(client)
+    claim(client, task["id"])
+    endpoint = f"/tasks/{task['id']}/complete"
+    key = "colliding-complete"
+    first = client.post(
+        endpoint,
+        json={"output": {"result": "original"}},
+        headers={"Idempotency-Key": key, "If-Match": '"v2"'},
+    )
+
+    different_content = client.post(
+        endpoint,
+        json={"output": {"result": "different"}},
+        headers={"Idempotency-Key": key, "If-Match": '"v2"'},
+    )
+    different_if_match = client.post(
+        endpoint,
+        json={"output": {"result": "original"}},
+        headers={"Idempotency-Key": key, "If-Match": '"v3"'},
+    )
+
+    assert first.status_code == 200
+    for collision in (different_content, different_if_match):
+        assert collision.status_code == 409
+        assert collision.json()["detail"]["code"] == "idempotency_key_reused"
+    assert client.get(f"/tasks/{task['id']}").json()["version"] == 3
+    assert len(client.get(f"/tasks/{task['id']}/events").json()) == 3
+
+
 def test_wrong_if_match_returns_version_conflict(client):
     task = create_ready_task(client)
     claim(client, task["id"])

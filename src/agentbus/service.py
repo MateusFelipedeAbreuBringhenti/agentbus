@@ -471,7 +471,7 @@ def claim_task(
         return TaskCommandResult(task=task, replayed=False)
 
 
-def _running_task_identity(row: sqlite3.Row) -> str:
+def _assigned_task_identity(row: sqlite3.Row) -> str:
     if row["assigned_to"] is None:
         raise TaskStateConflict(TaskStatus.RUNNING, TaskStatus(row["status"]))
     return row["assigned_to"]
@@ -493,7 +493,7 @@ def complete_task(
         ).fetchone()
         if row is None:
             raise TaskNotFound
-        actor_id = _running_task_identity(row)
+        actor_id = _assigned_task_identity(row)
         scope = _command_scope(actor_id, COMPLETE_TASK_OPERATION)
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
         if replayed is not None:
@@ -572,7 +572,7 @@ def fail_task(
         ).fetchone()
         if row is None:
             raise TaskNotFound
-        actor_id = _running_task_identity(row)
+        actor_id = _assigned_task_identity(row)
         scope = _command_scope(actor_id, FAIL_TASK_OPERATION)
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
         if replayed is not None:
