@@ -22,4 +22,3 @@ CREATE INDEX idx_approvals_correlation_id ON approvals(correlation_id);
 CREATE UNIQUE INDEX idx_approvals_one_pending_gate
 ON approvals(task_id, gate)
 WHERE status = 'pending';
-
