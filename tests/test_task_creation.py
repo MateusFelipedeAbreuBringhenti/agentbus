@@ -111,6 +111,85 @@ def test_different_requesters_can_reuse_same_idempotency_key(client, correlation
     assert dex_response.json()["requested_by"] == "dex"
 
 
+def test_existing_event_in_same_correlation_is_accepted_as_cause(client, correlation_id):
+    root = client.post(
+        "/tasks",
+        json=task_payload(correlation_id),
+        headers={"Idempotency-Key": "causal-root"},
+    )
+    root_event = client.get(f"/tasks/{root.json()['id']}/events").json()[0]
+    child_payload = {
+        **task_payload(correlation_id),
+        "title": "Causally related task",
+        "causation_event_id": root_event["id"],
+    }
+
+    child = client.post(
+        "/tasks",
+        json=child_payload,
+        headers={"Idempotency-Key": "causal-child"},
+    )
+
+    assert child.status_code == 201
+    child_event = client.get(f"/tasks/{child.json()['id']}/events").json()[0]
+    assert child_event["causation_event_id"] == root_event["id"]
+    assert child_event["correlation_id"] == correlation_id
+
+
+def test_missing_causation_event_returns_domain_error_without_partial_state(
+    client,
+    database_path,
+    correlation_id,
+):
+    payload = {
+        **task_payload(correlation_id),
+        "causation_event_id": str(uuid4()),
+    }
+
+    response = client.post(
+        "/tasks",
+        json=payload,
+        headers={"Idempotency-Key": "missing-cause"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "causation_event_not_found"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0] == 0
+
+
+def test_cause_from_another_correlation_returns_conflict_without_partial_state(
+    client,
+    database_path,
+    correlation_id,
+):
+    root = client.post(
+        "/tasks",
+        json=task_payload(correlation_id),
+        headers={"Idempotency-Key": "other-correlation-root"},
+    )
+    root_event = client.get(f"/tasks/{root.json()['id']}/events").json()[0]
+    payload = {
+        **task_payload(str(uuid4())),
+        "causation_event_id": root_event["id"],
+    }
+
+    response = client.post(
+        "/tasks",
+        json=payload,
+        headers={"Idempotency-Key": "mismatched-cause"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "causation_correlation_mismatch"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0] == 1
+
+
 def test_event_failure_rolls_back_task_event_and_idempotency(
     client,
     database_path,

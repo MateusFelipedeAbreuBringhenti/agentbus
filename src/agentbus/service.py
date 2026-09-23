@@ -17,6 +17,14 @@ class IdempotencyConflict(Exception):
     """An idempotency key was reused with a different request."""
 
 
+class CausationEventNotFound(Exception):
+    """The declared causation event does not exist."""
+
+
+class CausationCorrelationMismatch(Exception):
+    """The causation event belongs to another correlation."""
+
+
 @dataclass(frozen=True)
 class CreateTaskResult:
     task: TaskRead
@@ -105,6 +113,16 @@ def create_task(
                 task=TaskRead.model_validate_json(existing["response_body"]),
                 replayed=True,
             )
+
+        if request.causation_event_id is not None:
+            cause = connection.execute(
+                "SELECT correlation_id FROM events WHERE id = ?",
+                (str(request.causation_event_id),),
+            ).fetchone()
+            if cause is None:
+                raise CausationEventNotFound
+            if cause["correlation_id"] != str(request.correlation_id):
+                raise CausationCorrelationMismatch
 
         task_id = uuid4()
         event_id = uuid4()

@@ -11,6 +11,8 @@ from fastapi.responses import JSONResponse
 from agentbus.database import Database
 from agentbus.models import EventRead, TaskCreate, TaskRead
 from agentbus.service import (
+    CausationCorrelationMismatch,
+    CausationEventNotFound,
     IdempotencyConflict,
     create_task,
     get_task,
@@ -41,6 +43,36 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
                 "detail": {
                     "code": "idempotency_key_reused",
                     "message": "Idempotency-Key was already used with a different request.",
+                }
+            },
+        )
+
+    @app.exception_handler(CausationEventNotFound)
+    async def causation_event_not_found_handler(
+        _: Request,
+        __: CausationEventNotFound,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": {
+                    "code": "causation_event_not_found",
+                    "message": "The declared causation event does not exist.",
+                }
+            },
+        )
+
+    @app.exception_handler(CausationCorrelationMismatch)
+    async def causation_correlation_mismatch_handler(
+        _: Request,
+        __: CausationCorrelationMismatch,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "causation_correlation_mismatch",
+                    "message": "The causation event belongs to another correlation.",
                 }
             },
         )
