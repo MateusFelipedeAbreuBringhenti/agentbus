@@ -28,6 +28,28 @@ class TaskCreate(BaseModel):
     causation_event_id: UUID | None = None
 
 
+class TaskClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(min_length=1, max_length=200)
+    causation_event_id: UUID | None = None
+
+
+class TaskComplete(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    output: dict[str, Any]
+    causation_event_id: UUID | None = None
+
+
+class TaskFail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    failure_code: str = Field(min_length=1, max_length=100)
+    failure_message: str = Field(min_length=1, max_length=10_000)
+    causation_event_id: UUID | None = None
+
+
 class TaskRead(BaseModel):
     id: UUID
     type: str
