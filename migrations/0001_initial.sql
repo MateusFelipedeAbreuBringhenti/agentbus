@@ -48,6 +48,18 @@ CREATE TABLE events (
 
 CREATE INDEX idx_events_correlation_id ON events(correlation_id);
 
+CREATE TRIGGER events_are_append_only_on_update
+BEFORE UPDATE ON events
+BEGIN
+    SELECT RAISE(ABORT, 'events are append-only');
+END;
+
+CREATE TRIGGER events_are_append_only_on_delete
+BEFORE DELETE ON events
+BEGIN
+    SELECT RAISE(ABORT, 'events are append-only');
+END;
+
 CREATE TABLE idempotency_records (
     scope TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -62,4 +74,3 @@ CREATE TABLE idempotency_records (
     created_at TEXT NOT NULL,
     PRIMARY KEY(scope, key)
 );
-

@@ -36,13 +36,14 @@ class Database:
                 return
 
             migration = MIGRATION_PATH.read_text(encoding="utf-8")
-            connection.executescript(migration)
-            connection.execute(
-                """
+            connection.executescript(
+                "BEGIN IMMEDIATE;\n"
+                + migration
+                + f"""
                 INSERT INTO schema_migrations(version, applied_at)
-                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                """,
-                (MIGRATION_VERSION,),
+                VALUES ({MIGRATION_VERSION}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+                COMMIT;
+                """
             )
 
     @contextmanager
@@ -57,4 +58,3 @@ class Database:
             raise
         finally:
             connection.close()
-

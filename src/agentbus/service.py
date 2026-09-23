@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from contextlib import closing
 import hashlib
 import json
 import sqlite3
@@ -201,7 +202,7 @@ def create_task(
 
 
 def get_task(database: Database, task_id: UUID) -> TaskRead | None:
-    with database.connect() as connection:
+    with closing(database.connect()) as connection:
         row = connection.execute(
             "SELECT * FROM tasks WHERE id = ?",
             (str(task_id),),
@@ -210,10 +211,9 @@ def get_task(database: Database, task_id: UUID) -> TaskRead | None:
 
 
 def get_task_events(database: Database, task_id: UUID) -> list[EventRead]:
-    with database.connect() as connection:
+    with closing(database.connect()) as connection:
         rows = connection.execute(
             "SELECT * FROM events WHERE task_id = ? ORDER BY sequence",
             (str(task_id),),
         ).fetchall()
     return [_event_from_row(row) for row in rows]
-
