@@ -317,6 +317,25 @@ def test_release_replay_is_exact_and_does_not_add_events(client):
     assert len(client.get(f"/tasks/{task['id']}/events").json()) == 5
 
 
+def test_release_idempotency_hash_includes_specific_approval_id(client):
+    task = create_task(client)
+    approval = request_approval(client, task["id"]).json()["approval"]
+    decide(client, approval["id"], "approve", key="approve-before-release-collision")
+    first = release(client, task["id"], approval["id"], key="release-id-collision")
+
+    collision = release(
+        client,
+        task["id"],
+        str(uuid4()),
+        key="release-id-collision",
+    )
+
+    assert first.status_code == 200
+    assert collision.status_code == 409
+    assert collision.json()["detail"]["code"] == "idempotency_key_reused"
+    assert len(client.get(f"/tasks/{task['id']}/events").json()) == 5
+
+
 def test_approval_decision_idempotency_collision_returns_conflict(client):
     task = create_task(client)
     approval = request_approval(client, task["id"]).json()["approval"]
