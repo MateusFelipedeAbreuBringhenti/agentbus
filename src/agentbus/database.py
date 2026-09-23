@@ -1,5 +1,5 @@
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 import sqlite3
 
@@ -22,7 +22,7 @@ class Database:
         return connection
 
     def migrate(self) -> None:
-        with self.connect() as connection:
+        with closing(self.connect()) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -32,23 +32,30 @@ class Database:
                 """
             )
             for version, migration_path in MIGRATIONS:
-                applied = connection.execute(
-                    "SELECT 1 FROM schema_migrations WHERE version = ?",
-                    (version,),
-                ).fetchone()
-                if applied is not None:
-                    continue
-
                 migration = migration_path.read_text(encoding="utf-8")
-                connection.executescript(
-                    "BEGIN IMMEDIATE;\n"
-                    + migration
-                    + f"""
-                    INSERT INTO schema_migrations(version, applied_at)
-                    VALUES ({version}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-                    COMMIT;
-                    """
-                )
+                with connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    applied = connection.execute(
+                        "SELECT 1 FROM schema_migrations WHERE version = ?",
+                        (version,),
+                    ).fetchone()
+                    if applied is not None:
+                        continue
+                    # executescript implicitly commits an existing transaction.
+                    # Execute complete SQL statements instead, including triggers.
+                    statement = ""
+                    for line in migration.splitlines(keepends=True):
+                        statement += line
+                        if sqlite3.complete_statement(statement):
+                            connection.execute(statement)
+                            statement = ""
+                    if statement.strip():
+                        connection.execute(statement)
+                    connection.execute(
+                        """INSERT INTO schema_migrations(version, applied_at)
+                        VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
+                        (version,),
+                    )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

@@ -144,7 +144,9 @@ def _command_request_hash(
         {
             "body": request.model_dump(mode="json"),
             "expected_version": expected_version,
-            "resource_id": str(resource_id),
+            # Preserve persisted Slice #002 fingerprints across the v2 upgrade.
+            ("task_id" if isinstance(request, (TaskClaim, TaskComplete, TaskFail))
+             else "resource_id"): str(resource_id),
         },
         ensure_ascii=False,
         separators=(",", ":"),
