@@ -96,6 +96,7 @@ class TaskRead(BaseModel):
     failure_code: str | None
     failure_message: str | None
     retry_of: UUID | None
+    waiting_on_approval_id: UUID | None
     correlation_id: UUID
     version: int
     created_at: datetime

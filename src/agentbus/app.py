@@ -27,6 +27,7 @@ from agentbus.models import (
 from agentbus.service import (
     ApprovalCorrelationMismatch,
     ApprovalNotFound,
+    ApprovalNotCurrentForTask,
     ApprovalStateConflict,
     ApprovalTaskMismatch,
     ApprovalVersionConflict,
@@ -292,6 +293,21 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
                 "detail": {
                     "code": "approval_correlation_mismatch",
                     "message": "Approval belongs to another correlation.",
+                }
+            },
+        )
+
+    @app.exception_handler(ApprovalNotCurrentForTask)
+    async def approval_not_current_for_task_handler(
+        _: Request,
+        __: ApprovalNotCurrentForTask,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "approval_not_current_for_task",
+                    "message": "Approval did not open the Task's current wait.",
                 }
             },
         )

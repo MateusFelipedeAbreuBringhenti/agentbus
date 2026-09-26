@@ -88,6 +88,10 @@ class ApprovalCorrelationMismatch(Exception):
     """The Approval belongs to a different correlation."""
 
 
+class ApprovalNotCurrentForTask(Exception):
+    """The Approval did not open the Task's current wait."""
+
+
 class PendingApprovalConflict(Exception):
     """A pending Approval already exists for this Task and gate."""
 
@@ -333,6 +337,11 @@ def _task_from_row(row: sqlite3.Row) -> TaskRead:
         failure_code=row["failure_code"],
         failure_message=row["failure_message"],
         retry_of=row["retry_of"],
+        waiting_on_approval_id=(
+            row["waiting_on_approval_id"]
+            if "waiting_on_approval_id" in row.keys()
+            else None
+        ),
         correlation_id=row["correlation_id"],
         version=row["version"],
         created_at=row["created_at"],
@@ -483,6 +492,7 @@ def create_task(
             failure_code=None,
             failure_message=None,
             retry_of=None,
+            waiting_on_approval_id=None,
             correlation_id=request.correlation_id,
             version=1,
             created_at=now,
@@ -782,17 +792,6 @@ def request_task_approval(
             raise TaskVersionConflict(expected_version, row["version"])
 
         now = datetime.now(UTC).isoformat()
-        updated = connection.execute(
-            """
-            UPDATE tasks
-            SET status = 'waiting_approval', updated_at = ?, version = version + 1
-            WHERE id = ? AND status = 'ready' AND version = ?
-            """,
-            (now, str(task_id), expected_version),
-        )
-        if updated.rowcount != 1:
-            raise TaskVersionConflict(expected_version, row["version"])
-
         approval_id = uuid4()
         try:
             connection.execute(
@@ -825,6 +824,18 @@ def request_task_approval(
             if "approvals.task_id, approvals.gate" in str(error):
                 raise PendingApprovalConflict from error
             raise
+
+        updated = connection.execute(
+            """
+            UPDATE tasks
+            SET status = 'waiting_approval', waiting_on_approval_id = ?,
+                updated_at = ?, version = version + 1
+            WHERE id = ? AND status = 'ready' AND version = ?
+            """,
+            (str(approval_id), now, str(task_id), expected_version),
+        )
+        if updated.rowcount != 1:
+            raise TaskVersionConflict(expected_version, row["version"])
 
         task = _task_from_row(
             connection.execute("SELECT * FROM tasks WHERE id = ?", (str(task_id),)).fetchone()
@@ -1031,6 +1042,8 @@ def release_task(
             raise ApprovalTaskMismatch
         if approval_row["correlation_id"] != row["correlation_id"]:
             raise ApprovalCorrelationMismatch
+        if row["waiting_on_approval_id"] != str(request.approval_id):
+            raise ApprovalNotCurrentForTask
         if approval_row["status"] != ApprovalStatus.APPROVED.value:
             raise ApprovalStateConflict(
                 ApprovalStatus.APPROVED,
@@ -1048,7 +1061,8 @@ def release_task(
         updated = connection.execute(
             """
             UPDATE tasks
-            SET status = 'ready', updated_at = ?, version = version + 1
+            SET status = 'ready', waiting_on_approval_id = NULL,
+                updated_at = ?, version = version + 1
             WHERE id = ? AND status = 'waiting_approval' AND version = ?
             """,
             (now, str(task_id), expected_version),
