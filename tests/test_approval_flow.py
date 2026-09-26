@@ -112,6 +112,7 @@ def test_full_approved_flow_preserves_boundary_versions_and_event_history(
     approval = requested_body["approval"]
     assert requested_body["task"]["status"] == "waiting_approval"
     assert requested_body["task"]["version"] == 2
+    assert requested_body["task"]["waiting_on_approval_id"] == approval["id"]
     assert approval["status"] == "pending"
     assert approval["version"] == 1
     assert approval["gate"] == "deployment.production"
@@ -131,6 +132,7 @@ def test_full_approved_flow_preserves_boundary_versions_and_event_history(
     blocked_task = client.get(f"/tasks/{task['id']}").json()
     assert blocked_task["status"] == "waiting_approval"
     assert blocked_task["version"] == 2
+    assert blocked_task["waiting_on_approval_id"] == approval["id"]
 
     approval_event = client.get(f"/tasks/{task['id']}/events").json()[3]
     released = release(
@@ -143,6 +145,7 @@ def test_full_approved_flow_preserves_boundary_versions_and_event_history(
     assert released.headers["etag"] == '"v3"'
     assert released.json()["status"] == "ready"
     assert released.json()["version"] == 3
+    assert released.json()["waiting_on_approval_id"] is None
     unchanged_approval = client.get(f"/approvals/{approval['id']}")
     assert unchanged_approval.json()["status"] == "approved"
     assert unchanged_approval.json()["version"] == 2
@@ -183,6 +186,7 @@ def test_rejected_approval_leaves_task_waiting(client):
     blocked_task = client.get(f"/tasks/{task['id']}").json()
     assert blocked_task["status"] == "waiting_approval"
     assert blocked_task["version"] == 2
+    assert blocked_task["waiting_on_approval_id"] == approval["id"]
 
 
 def test_concurrent_approve_and_reject_only_allow_one_decision(client):
@@ -283,6 +287,8 @@ def test_request_approval_replay_is_exact_and_does_not_add_events(client):
     assert first.headers["Task-ETag"] == replay.headers["Task-ETag"] == '"v2"'
     assert first.headers["Approval-ETag"] == replay.headers["Approval-ETag"] == '"v1"'
     assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json()["task"]["waiting_on_approval_id"] == replay.json()["approval"]["id"]
+    assert client.get(f"/tasks/{task['id']}").json()["waiting_on_approval_id"] == replay.json()["approval"]["id"]
     assert len(client.get(f"/tasks/{task['id']}/events").json()) == 3
 
 
@@ -299,6 +305,7 @@ def test_approval_decision_replay_is_exact(client, decision):
     assert first.json() == replay.json()
     assert first.headers["etag"] == replay.headers["etag"] == '"v2"'
     assert replay.headers["Idempotency-Replayed"] == "true"
+    assert client.get(f"/tasks/{task['id']}").json()["waiting_on_approval_id"] == approval["id"]
     assert len(client.get(f"/tasks/{task['id']}/events").json()) == 4
 
 
@@ -314,6 +321,8 @@ def test_release_replay_is_exact_and_does_not_add_events(client):
     assert first.json() == replay.json()
     assert first.headers["etag"] == replay.headers["etag"] == '"v3"'
     assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json()["waiting_on_approval_id"] is None
+    assert client.get(f"/tasks/{task['id']}").json()["waiting_on_approval_id"] is None
     assert len(client.get(f"/tasks/{task['id']}/events").json()) == 5
 
 

@@ -78,10 +78,12 @@ POST /approvals/{id}/reject        Approval pending → rejected
 POST /tasks/{id}/release           Task waiting_approval → ready
 ```
 
-Decidir uma Approval nunca altera a Task. `release` precisa indicar uma
-`approval_id` específica, aprovada, pertencente à mesma Task e correlação. Uma
-Approval rejeitada deixa a Task em `waiting_approval`; nenhuma política de
-workflow é inferida.
+Decidir uma Approval nunca altera a Task. Enquanto espera, a Task expõe
+`waiting_on_approval_id`, que identifica explicitamente a Approval que abriu a
+espera atual. `release` precisa indicar exatamente essa Approval, já aprovada e
+pertencente à mesma Task e correlação. Uma Approval antiga não pode liberar uma
+espera posterior. Uma Approval rejeitada deixa a Task em `waiting_approval` e
+mantém o vínculo; nenhuma política de workflow é inferida.
 
 `request-approval` retorna as representações de Task e Approval juntas, com
 `Task-ETag` e `Approval-ETag`. Decisões retornam a Approval e seu ETag; `release`

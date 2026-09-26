@@ -51,7 +51,7 @@ def test_v1_replays_survive_v2_upgrade(tmp_path, monkeypatch, terminal):
             assert response.headers['Idempotency-Replayed'] == 'true'
     with closing(sqlite3.connect(path)) as connection:
         assert connection.execute('SELECT count(*) FROM events').fetchone()[0] == 3
-        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,)]
+        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,)]
 
 
 def test_two_migrators_recheck_version_after_acquiring_write_lock(tmp_path, monkeypatch):
@@ -75,7 +75,7 @@ def test_two_migrators_recheck_version_after_acquiring_write_lock(tmp_path, monk
         for future in futures:
             future.result(timeout=10)
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,)]
+        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,)]
 
 
 def test_failed_v2_migration_rolls_back_schema_and_can_retry(tmp_path, monkeypatch):

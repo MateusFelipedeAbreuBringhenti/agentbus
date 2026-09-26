@@ -25,13 +25,35 @@ def test_partial_index_failure_rolls_back_preceding_task_update(client, database
     approval = request_approval(client, task['id']).json()['approval']
     # Deliberately seed the otherwise unreachable ready + pending storage boundary.
     with sqlite3.connect(database_path) as db:
-        db.execute("UPDATE tasks SET status='ready', version=1 WHERE id=?", (task['id'],))
+        db.execute(
+            """UPDATE tasks
+            SET status='ready', version=1, waiting_on_approval_id=NULL
+            WHERE id=?""",
+            (task['id'],),
+        )
     before = snapshot(database_path)
     response = request_approval(client, task['id'], key='index-rejection')
     assert response.status_code == 409
     assert response.json()['detail']['code'] == 'pending_approval_conflict'
     assert snapshot(database_path) == before
     assert before['approvals'][0][0] == approval['id']
+
+
+def test_request_failure_cannot_leave_dangling_wait_link(client, database_path):
+    task = create_task(client)
+    before = snapshot(database_path)
+    with sqlite3.connect(database_path) as db:
+        db.execute(
+            """CREATE TRIGGER reject_approval_insert
+            BEFORE INSERT ON approvals
+            BEGIN SELECT RAISE(ABORT, 'injected approval failure'); END"""
+        )
+
+    assert request_approval(client, task['id'], key='dangling-link').status_code == 500
+    assert snapshot(database_path) == before
+    persisted = client.get(f"/tasks/{task['id']}").json()
+    assert persisted['status'] == 'ready'
+    assert persisted['waiting_on_approval_id'] is None
 
 
 @pytest.mark.parametrize('operation,table,event_type', [
@@ -167,6 +189,30 @@ def test_sqlite_command_event_index_and_pending_index_boundaries(client, databas
                        (str(uuid4()), gate, state, approval['id']))
 
 
+def test_sqlite_enforces_task_wait_link_invariant(client, database_path):
+    task = create_task(client)
+    approval = request_approval(client, task['id']).json()['approval']
+    with sqlite3.connect(database_path) as db:
+        with pytest.raises(sqlite3.IntegrityError, match='invalid task approval wait link'):
+            db.execute(
+                "UPDATE tasks SET waiting_on_approval_id=NULL WHERE id=?",
+                (task['id'],),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match='invalid task approval wait link'):
+            db.execute(
+                "UPDATE tasks SET status='ready' WHERE id=?",
+                (task['id'],),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match='invalid task approval wait link'):
+            db.execute(
+                "UPDATE tasks SET waiting_on_approval_id=? WHERE id=?",
+                (str(uuid4()), task['id']),
+            )
+    persisted = client.get(f"/tasks/{task['id']}").json()
+    assert persisted['status'] == 'waiting_approval'
+    assert persisted['waiting_on_approval_id'] == approval['id']
+
+
 def test_decision_scope_belongs_to_decider_not_requester(client, database_path):
     first = create_task(client)
     second = create_task(client)
@@ -228,7 +274,6 @@ def test_commit_failure_restores_every_record(client, database_path, monkeypatch
     assert snapshot(database_path) == before
 
 
-@pytest.mark.xfail(strict=True, reason='Contract decision required: no binding between current wait and its Approval')
 def test_old_approval_cannot_release_new_wait(client):
     task = create_task(client)
     old = request_approval(client, task['id']).json()['approval']
@@ -242,3 +287,17 @@ def test_old_approval_cannot_release_new_wait(client):
                         json={'approval_id': old['id'], 'actor_id': 'orion'},
                         headers={'Idempotency-Key': 'old-approval-again', 'If-Match': '"v4"'})
     assert bypass.status_code == 409
+    assert bypass.json()['detail']['code'] == 'approval_not_current_for_task'
+    blocked = client.get(f"/tasks/{task['id']}").json()
+    assert blocked['status'] == 'waiting_approval'
+    assert blocked['waiting_on_approval_id'] == new.json()['approval']['id']
+    assert new.json()['approval']['status'] == 'pending'
+    decide(client, new.json()['approval']['id'], 'approve', key='approve-new')
+    released = client.post(
+        f"/tasks/{task['id']}/release",
+        json={'approval_id': new.json()['approval']['id'], 'actor_id': 'orion'},
+        headers={'Idempotency-Key': 'release-new', 'If-Match': '"v4"'},
+    )
+    assert released.status_code == 200
+    assert released.json()['status'] == 'ready'
+    assert released.json()['waiting_on_approval_id'] is None

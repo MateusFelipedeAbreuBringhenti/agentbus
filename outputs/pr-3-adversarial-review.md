@@ -5,7 +5,7 @@ Escopo: invariantes do Slice #003 e compatibilidade com dados do Slice #002.
 
 ## Achados confirmados
 
-### Bloqueador arquitetural: Approval antiga libera nova espera
+### Resolvido por decisão de Orion: identidade explícita da espera
 
 Reprodução usando somente endpoints públicos, sem adulterar o banco:
 
@@ -22,18 +22,26 @@ autorize a espera atual. O argumento de que sair de `waiting_approval` impede
 reutilização só vale até o próximo pedido. Esse caminho já está acessível por
 `request-approval`, embora re-request tenha sido excluído do slice.
 
-Não foi aplicada política nova. Orion deve decidir entre, por exemplo:
+Orion escolheu vincular explicitamente cada espera à Approval que a originou.
+A Task agora expõe `waiting_on_approval_id`. `request-approval` insere a
+Approval e estabelece o vínculo na mesma transação; decisões não o alteram;
+`release` aceita somente o ID corrente e limpa o vínculo ao retornar a Task
+para `ready`. A tentativa com Approval antiga retorna
+`409 approval_not_current_for_task` sem alterar Task ou Approval atual.
 
-- restringir o slice a uma única solicitação de Approval por Task; ou
-- vincular explicitamente cada espera à Approval que a originou.
+O antigo `xfail(strict=True)` virou teste normal e também prova o ciclo seguinte:
+A aprovada/liberada, B solicitada, A recusada como stale, B ainda pending e
+vinculada, seguida de aprovação/liberação válida de B.
 
-Adicionar apenas `consumed` não define sozinho qual Approval corresponde à
-espera atual. Escolher a Approval por eventos também contrariaria a decisão de
-não usar eventos como fonte do estado.
+### Migração v2 → v3
 
-O teste `test_old_approval_cannot_release_new_wait` registra a propriedade
-desejada como `xfail(strict=True)`. É uma falha conhecida, não uma aprovação
-do comportamento observado. PR deve permanecer aberto para decisão de Orion.
+A migration incremental adiciona o vínculo e preserva todos os demais dados.
+Uma Task v2 em espera é preenchida quando existe exatamente uma Approval
+`pending` da mesma Task e correlação — inclusive se houver histórico terminal —
+ou, sem pending, quando existe uma única Approval total. Zero candidatas,
+múltiplas pending ou múltiplas candidatas terminais tornam a relação ambígua;
+nesses casos a migration aborta e reverte por inteiro, sem escolher por gate,
+versão, último evento ou ordem de criação.
 
 ### Corrigido: upgrade invalida hashes idempotentes anteriores
 
@@ -91,6 +99,7 @@ Não houve estado parcial: a ordem atual das operações está protegida pelo ro
 
 ## Resultado
 
-41 casos adicionais: 40 passam e um documenta o blocker com xfail estrito.
-Suíte total: 84 passed, 1 xfailed. Compileall e git diff --check aprovados.
-Nenhum contrato foi alterado para resolver o blocker; nenhum Slice #004 iniciado.
+O vínculo explícito tem cobertura de fluxo, rejeição, replay, rollback,
+persistência direta e upgrade v2→v3, inclusive rollback de migration ambígua.
+Resultado final e SHA publicados no relatório de entrega. Nenhum Slice #004
+foi iniciado.
