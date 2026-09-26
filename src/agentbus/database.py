@@ -1,11 +1,15 @@
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 import sqlite3
 
 
-MIGRATION_VERSION = 1
-MIGRATION_PATH = Path(__file__).resolve().parents[2] / "migrations" / "0001_initial.sql"
+MIGRATIONS_DIRECTORY = Path(__file__).resolve().parents[2] / "migrations"
+MIGRATIONS = (
+    (1, MIGRATIONS_DIRECTORY / "0001_initial.sql"),
+    (2, MIGRATIONS_DIRECTORY / "0002_approvals.sql"),
+    (3, MIGRATIONS_DIRECTORY / "0003_task_approval_wait_link.sql"),
+)
 
 
 class Database:
@@ -19,7 +23,7 @@ class Database:
         return connection
 
     def migrate(self) -> None:
-        with self.connect() as connection:
+        with closing(self.connect()) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -28,23 +32,31 @@ class Database:
                 )
                 """
             )
-            applied = connection.execute(
-                "SELECT 1 FROM schema_migrations WHERE version = ?",
-                (MIGRATION_VERSION,),
-            ).fetchone()
-            if applied is not None:
-                return
-
-            migration = MIGRATION_PATH.read_text(encoding="utf-8")
-            connection.executescript(
-                "BEGIN IMMEDIATE;\n"
-                + migration
-                + f"""
-                INSERT INTO schema_migrations(version, applied_at)
-                VALUES ({MIGRATION_VERSION}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-                COMMIT;
-                """
-            )
+            for version, migration_path in MIGRATIONS:
+                migration = migration_path.read_text(encoding="utf-8")
+                with connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    applied = connection.execute(
+                        "SELECT 1 FROM schema_migrations WHERE version = ?",
+                        (version,),
+                    ).fetchone()
+                    if applied is not None:
+                        continue
+                    # executescript implicitly commits an existing transaction.
+                    # Execute complete SQL statements instead, including triggers.
+                    statement = ""
+                    for line in migration.splitlines(keepends=True):
+                        statement += line
+                        if sqlite3.complete_statement(statement):
+                            connection.execute(statement)
+                            statement = ""
+                    if statement.strip():
+                        connection.execute(statement)
+                    connection.execute(
+                        """INSERT INTO schema_migrations(version, applied_at)
+                        VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
+                        (version,),
+                    )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
