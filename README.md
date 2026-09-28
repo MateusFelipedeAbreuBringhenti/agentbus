@@ -94,6 +94,27 @@ As identidades `requested_by`, `decided_by` e `actor_id` são autodeclaradas no
 MVP. Elas definem autoria e escopo idempotente, mas não representam autenticação
 ou autorização verificadas.
 
+## Inbox de agente
+
+`GET /agents/{agent_id}/inbox` deriva a atenção ativa diretamente de Task e
+Approval. A resposta reúne Tasks `ready` destinadas ao agente, Tasks `running`
+atualmente atribuídas a ele e Approvals `pending` destinadas a ele. Cada item
+inclui a representação atual, correlação, versão, ETag e apenas as ações fixas
+que os comandos existentes aceitam naquele estado.
+
+Os itens são ordenados do mais antigo para o mais novo pelo instante em que
+passaram a exigir atenção, com tipo e ID como desempate determinístico. Tasks e
+Approvals terminais desaparecem da inbox.
+
+Uma Task `ready` com `assigned_to` está reservada para essa identidade e não
+pode ser reivindicada por outra. Trabalho sem `assigned_to` não pertence a uma
+inbox pessoal; ele continua reivindicável quando seu ID é conhecido, mas este
+slice não introduz um pool global de descoberta.
+
+A consulta usa polling HTTP simples e não mantém uma tabela de inbox. Como não
+há autenticação no MVP, consultar `/agents/dex/inbox` não comprova que o cliente
+é Dex; `agent_id` continua sendo identidade autodeclarada.
+
 ## Testes
 
 ```bash
