@@ -136,8 +136,10 @@ operação.
 `LocalCodexExecutor` é o primeiro adapter real. Ele usa o SDK oficial do Codex
 com o login ChatGPT já existente, sem API key, em workspace descartável com
 rede desabilitada e approvals negadas. Esse caminho consome os limites do plano
-Codex e não representa capacidade ilimitada. Contrato, isolamento, recuperação
-e smoke opt-in estão em
+Codex e não representa capacidade ilimitada. `workspace-write` limita escrita,
+mas não oferece confidencialidade contra leitura de outros arquivos acessíveis
+ao processo; o adapter deste slice aceita somente Tasks confiáveis/controladas.
+Contrato, fronteira de segurança, recuperação e smoke opt-in estão em
 [`docs/local-codex-executor.md`](docs/local-codex-executor.md).
 
 ## Testes

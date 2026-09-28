@@ -346,6 +346,8 @@ class LocalCodexExecutionStore:
 
 
 class LocalCodexExecutor:
+    """Execute trusted Tasks locally; workspace-write does not isolate reads."""
+
     _SAFE_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
     def __init__(

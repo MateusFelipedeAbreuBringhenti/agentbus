@@ -31,9 +31,19 @@ fora de `$HOME`. O adapter inicia Codex com:
 - no máximo oito arquivos inline, com nome simples e 64 KiB cada.
 
 O repositório AgentBus nunca é copiado para o workspace e nenhuma integração de
-GitHub é oferecida. O sandbox restringe escrita ao workspace; para tarefas não
-confiáveis que exijam também uma barreira de leitura no nível do sistema
-operacional, uma camada externa de isolamento continua necessária.
+GitHub é oferecida. O sandbox restringe escrita ao workspace, mas não restringe
+por padrão a leitura ao workspace. Um probe real com sentinelas artificiais
+confirmou que o runtime conseguiu ler o arquivo do workspace, outro arquivo em
+um diretório temporário externo e outro dentro de um diretório temporário sob
+`$HOME`. Também confirmou legibilidade de `/etc`, `/usr`, `/tmp` e `$HOME`, sem
+ler conteúdo real do usuário.
+
+**Fronteira de segurança:** `workspace-write` restringe escrita, mas o
+`LocalCodexExecutor` não fornece confidencialidade contra leitura de arquivos
+acessíveis ao processo/sandbox. Neste slice, ele deve receber somente Tasks
+confiáveis e controladas. Trabalho não confiável exige uma camada externa de
+isolamento de filesystem ou uma política explícita de leitura restrita, ainda
+não implementadas.
 
 ## Persistência e recuperação
 
