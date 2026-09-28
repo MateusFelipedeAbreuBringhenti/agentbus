@@ -93,6 +93,8 @@ class OpenAIAgentsProvider(Protocol):
 
     def retrieve_session(self, session_id: str) -> dict[str, Any]: ...
 
+    def retrieve_latest_turn(self, session_id: str) -> dict[str, Any] | None: ...
+
     def submit_tool_result(
         self,
         session_id: str,
@@ -169,6 +171,15 @@ class HttpOpenAIAgentsProvider:
 
     def retrieve_session(self, session_id: str) -> dict[str, Any]:
         return self._request("GET", f"/agents/sessions/{session_id}")
+
+    def retrieve_latest_turn(self, session_id: str) -> dict[str, Any] | None:
+        response = self._request(
+            "GET",
+            f"/agents/sessions/{session_id}/turns",
+            params={"limit": 1, "order": "desc"},
+        )
+        turns = response.get("data", [])
+        return turns[0] if turns else None
 
     def submit_tool_result(
         self,
@@ -397,6 +408,7 @@ class OpenAIAgentsExecutor:
             return self._to_execution_result(record.result)
 
         assert record.provider_session_id is not None
+        idle_observations = 0
         for _ in range(self.max_polls):
             session = self.provider.retrieve_session(record.provider_session_id)
             actions = session.get("required_actions") or []
@@ -429,10 +441,25 @@ class OpenAIAgentsExecutor:
                     failure_message=str(session.get("error") or session.get("status")),
                 )
             if session.get("status") == "idle":
-                return ExecutionFailed(
-                    failure_code="missing_structured_result",
-                    failure_message="The agent finished without calling submit_result.",
-                )
+                turn = self.provider.retrieve_latest_turn(record.provider_session_id)
+                if turn is not None and turn.get("status") == "failed":
+                    error = turn.get("error") or {}
+                    code = error.get("code") or "unknown"
+                    message = error.get("message") or "The remote turn failed."
+                    return ExecutionFailed(
+                        failure_code="openai_turn_failed",
+                        failure_message=f"{code}: {message}"[:2_000],
+                    )
+                idle_observations += 1
+                if idle_observations >= min(3, self.max_polls):
+                    return ExecutionFailed(
+                        failure_code="missing_structured_result",
+                        failure_message=(
+                            "The agent finished without calling submit_result."
+                        ),
+                    )
+            else:
+                idle_observations = 0
             time.sleep(self.poll_interval_seconds)
         raise OpenAIExecutionPending
 

@@ -30,6 +30,8 @@ class FakeAgentsProvider:
         self.create_payloads = []
         self.find_calls = []
         self.retrieve_calls = []
+        self.latest_turn_calls = []
+        self.latest_turn_responses = None
         self.tool_results = []
         self.lose_create_response = False
         self.lose_tool_response = False
@@ -68,6 +70,12 @@ class FakeAgentsProvider:
     def retrieve_session(self, session_id):
         self.retrieve_calls.append(session_id)
         return self.sessions[session_id]
+
+    def retrieve_latest_turn(self, session_id):
+        self.latest_turn_calls.append(session_id)
+        if self.latest_turn_responses is not None:
+            return self.latest_turn_responses.pop(0)
+        return self.sessions[session_id].get("latest_turn")
 
     def submit_tool_result(
         self,
@@ -279,6 +287,76 @@ def test_invalid_remote_result_becomes_stable_failure(tmp_path):
     assert first.failure_code == "invalid_remote_result"
     assert second == first
     assert len(provider.create_payloads) == 1
+
+
+def test_idle_session_reports_failed_remote_turn(tmp_path):
+    provider = FakeAgentsProvider()
+    executor, store = build_executor(tmp_path, provider)
+    request = execution_request()
+    try:
+        payload = executor._session_payload(request)
+        session = provider.create_session(payload)
+        session["required_actions"] = []
+        session["status"] = "idle"
+        session["latest_turn"] = {
+            "status": "failed",
+            "error": {
+                "code": "usage_limit_exceeded",
+                "message": "The project usage limit was reached.",
+            },
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        store.prepare(request.execution_id, request_hash)
+        store.link_session(request.execution_id, session["id"])
+
+        result = executor.execute(request)
+    finally:
+        store.close()
+
+    assert result == ExecutionFailed(
+        failure_code="openai_turn_failed",
+        failure_message=(
+            "usage_limit_exceeded: The project usage limit was reached."
+        ),
+    )
+    assert provider.latest_turn_calls == [session["id"]]
+
+
+def test_idle_session_waits_for_failed_turn_to_become_visible(tmp_path):
+    provider = FakeAgentsProvider()
+    provider.latest_turn_responses = [
+        None,
+        {
+            "status": "failed",
+            "error": {
+                "code": "usage_limit_exceeded",
+                "message": "The project usage limit was reached.",
+            },
+        },
+    ]
+    executor, store = build_executor(tmp_path, provider)
+    executor.max_polls = 2
+    request = execution_request()
+    try:
+        payload = executor._session_payload(request)
+        session = provider.create_session(payload)
+        session["required_actions"] = []
+        session["status"] = "idle"
+        request_hash = hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        store.prepare(request.execution_id, request_hash)
+        store.link_session(request.execution_id, session["id"])
+
+        result = executor.execute(request)
+    finally:
+        store.close()
+
+    assert isinstance(result, ExecutionFailed)
+    assert result.failure_code == "openai_turn_failed"
+    assert provider.latest_turn_calls == [session["id"], session["id"]]
 
 
 def test_task_text_cannot_change_admin_or_sandbox_configuration(tmp_path):
