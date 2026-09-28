@@ -115,6 +115,24 @@ A consulta usa polling HTTP simples e não mantém uma tabela de inbox. Como nã
 há autenticação no MVP, consultar `/agents/dex/inbox` não comprova que o cliente
 é Dex; `agent_id` continua sendo identidade autodeclarada.
 
+## Agent Runner
+
+O runner é um processo separado que consulta a inbox, reivindica Tasks e entrega
+um `ExecutionRequest` a qualquer implementação do contrato `WorkExecutor`. O
+AgentBus continua sendo a autoridade do lifecycle; o journal SQLite do runner
+guarda apenas ownership comprovado, `execution_id`, resultado ainda não reportado
+e confirmação terminal.
+
+O executor deve ser idempotente ou retomável por `execution_id`. Se o processo
+cair durante um efeito externo antes de persistir o resultado, o runner chamará
+o executor novamente com o mesmo ID. Isso não promete exatamente-uma-vez
+universal para efeitos externos.
+
+O runner processa estruturalmente apenas itens `kind=task`; seu cliente não
+oferece comandos de decisão de Approval. Consulte
+[`docs/agent-runner.md`](docs/agent-runner.md) para contrato, recuperação e
+operação.
+
 ## Testes
 
 ```bash
