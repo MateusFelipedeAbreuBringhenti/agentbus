@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -140,3 +140,24 @@ class EventRead(BaseModel):
     command_id: UUID
     event_index: int
     occurred_at: datetime
+
+
+class InboxTaskItem(BaseModel):
+    kind: Literal["task"] = "task"
+    attention_since: datetime
+    etag: str
+    available_actions: list[Literal["claim", "complete", "fail"]]
+    task: TaskRead
+
+
+class InboxApprovalItem(BaseModel):
+    kind: Literal["approval"] = "approval"
+    attention_since: datetime
+    etag: str
+    available_actions: list[Literal["approve", "reject"]]
+    approval: ApprovalRead
+
+
+class AgentInbox(BaseModel):
+    agent_id: str
+    items: list[InboxTaskItem | InboxApprovalItem]
