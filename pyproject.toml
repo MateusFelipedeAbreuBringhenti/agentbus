@@ -24,5 +24,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+markers = [
+    "live: opt-in test that consumes the real OpenAI Agents API",
+]
 pythonpath = ["src"]
 testpaths = ["tests"]
