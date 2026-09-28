@@ -10,10 +10,13 @@ from pydantic import BaseModel
 
 from agentbus.database import Database
 from agentbus.models import (
+    AgentInbox,
     ApprovalDecision,
     ApprovalRead,
     ApprovalStatus,
     EventRead,
+    InboxApprovalItem,
+    InboxTaskItem,
     RequestApproval,
     RequestApprovalResult,
     TaskClaim,
@@ -62,6 +65,12 @@ class TaskVersionConflict(Exception):
     def __init__(self, expected: int, actual: int) -> None:
         self.expected = expected
         self.actual = actual
+
+
+class TaskAssignmentConflict(Exception):
+    def __init__(self, requested: str, assigned_to: str) -> None:
+        self.requested = requested
+        self.assigned_to = assigned_to
 
 
 class ApprovalNotFound(Exception):
@@ -549,6 +558,10 @@ def claim_task(
             request.causation_event_id,
             row["correlation_id"],
         )
+        if row["status"] != TaskStatus.READY.value:
+            raise TaskStateConflict(TaskStatus.READY, TaskStatus(row["status"]))
+        if row["assigned_to"] is not None and row["assigned_to"] != request.agent_id:
+            raise TaskAssignmentConflict(request.agent_id, row["assigned_to"])
 
         now = datetime.now(UTC).isoformat()
         updated = connection.execute(
@@ -557,8 +570,9 @@ def claim_task(
             SET status = 'running', assigned_to = ?, started_at = ?,
                 updated_at = ?, version = version + 1
             WHERE id = ? AND status = 'ready'
+              AND (assigned_to IS NULL OR assigned_to = ?)
             """,
-            (request.agent_id, now, now, str(task_id)),
+            (request.agent_id, now, now, str(task_id), request.agent_id),
         )
         if updated.rowcount != 1:
             raise TaskStateConflict(TaskStatus.READY, TaskStatus(row["status"]))
@@ -1136,3 +1150,50 @@ def get_task_approvals(database: Database, task_id: UUID) -> list[ApprovalRead]:
             (str(task_id),),
         ).fetchall()
     return [_approval_from_row(row) for row in rows]
+
+
+def get_agent_inbox(database: Database, agent_id: str) -> AgentInbox:
+    with closing(database.connect()) as connection:
+        connection.execute("BEGIN")
+        task_rows = connection.execute(
+            """SELECT * FROM tasks
+            WHERE assigned_to = ? AND status IN ('ready', 'running')""",
+            (agent_id,),
+        ).fetchall()
+        approval_rows = connection.execute(
+            """SELECT * FROM approvals
+            WHERE assigned_to = ? AND status = 'pending'""",
+            (agent_id,),
+        ).fetchall()
+
+    items: list[InboxTaskItem | InboxApprovalItem] = []
+    for row in task_rows:
+        task = _task_from_row(row)
+        items.append(
+            InboxTaskItem(
+                attention_since=(task.created_at if task.status is TaskStatus.READY else task.updated_at),
+                etag=f'"v{task.version}"',
+                available_actions=(
+                    ["claim"] if task.status is TaskStatus.READY else ["complete", "fail"]
+                ),
+                task=task,
+            )
+        )
+    for row in approval_rows:
+        approval = _approval_from_row(row)
+        items.append(
+            InboxApprovalItem(
+                attention_since=approval.created_at,
+                etag=f'"v{approval.version}"',
+                available_actions=["approve", "reject"],
+                approval=approval,
+            )
+        )
+    items.sort(
+        key=lambda item: (
+            item.attention_since,
+            item.kind,
+            str(item.task.id if isinstance(item, InboxTaskItem) else item.approval.id),
+        )
+    )
+    return AgentInbox(agent_id=agent_id, items=items)

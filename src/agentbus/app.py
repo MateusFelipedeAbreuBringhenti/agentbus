@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from agentbus.database import Database
 from agentbus.models import (
+    AgentInbox,
     ApprovalDecision,
     ApprovalRead,
     ApprovalStatus,
@@ -36,6 +37,7 @@ from agentbus.service import (
     IdempotencyConflict,
     PendingApprovalConflict,
     TaskNotFound,
+    TaskAssignmentConflict,
     TaskStateConflict,
     TaskVersionConflict,
     claim_task,
@@ -44,6 +46,7 @@ from agentbus.service import (
     decide_approval,
     fail_task,
     get_approval,
+    get_agent_inbox,
     get_task,
     get_task_approvals,
     get_task_events,
@@ -334,6 +337,23 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             content={"detail": {"code": "database_error", "message": "Database operation failed."}},
         )
 
+    @app.exception_handler(TaskAssignmentConflict)
+    async def task_assignment_conflict_handler(
+        _: Request,
+        error: TaskAssignmentConflict,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": {
+                    "code": "task_assignment_conflict",
+                    "message": "Task is reserved for another agent identity.",
+                    "requested": error.requested,
+                    "assigned_to": error.assigned_to,
+                }
+            },
+        )
+
     @app.post("/tasks", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
     def create_task_endpoint(
         task: TaskCreate,
@@ -356,6 +376,10 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         if task is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
         return _task_response(task, status_code=status.HTTP_200_OK)
+
+    @app.get("/agents/{agent_id}/inbox", response_model=AgentInbox)
+    def get_agent_inbox_endpoint(agent_id: str) -> AgentInbox:
+        return get_agent_inbox(database, agent_id)
 
     @app.post("/tasks/{task_id}/claim", response_model=TaskRead)
     def claim_task_endpoint(
