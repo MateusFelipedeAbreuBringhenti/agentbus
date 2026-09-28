@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
+from threading import Barrier
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -148,6 +150,73 @@ def test_reserved_task_cannot_be_claimed_by_another_identity(client):
     }
     assert inbox(client, "dex")["items"][0]["task"]["status"] == "ready"
     assert inbox(client, "orion")["items"] == []
+
+
+def test_independent_connections_report_concurrent_claim_loser_as_running(
+    client, database_path
+):
+    task = create_task(client, assigned_to=None)
+    barrier = Barrier(2)
+    with TestClient(create_app(database_path)) as other:
+        def attempt(api, agent_id):
+            barrier.wait(timeout=5)
+            return claim(
+                api,
+                task,
+                agent_id=agent_id,
+                key=f"claim-{agent_id}",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(
+                executor.map(
+                    lambda arguments: attempt(*arguments),
+                    [(client, "dex"), (other, "orion")],
+                )
+            )
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    winner = next(response for response in responses if response.status_code == 200)
+    loser = next(response for response in responses if response.status_code == 409)
+    assert loser.json()["detail"] == {
+        "code": "task_state_conflict",
+        "message": "Task is not in the state required by this command.",
+        "expected": "ready",
+        "actual": "running",
+    }
+    persisted = client.get(f"/tasks/{task['id']}").json()
+    assert persisted == winner.json()
+    assert persisted["status"] == "running"
+    assert persisted["assigned_to"] in {"dex", "orion"}
+
+
+def test_independent_connections_same_agent_and_key_write_once_then_replay(
+    client, database_path
+):
+    task = create_task(client, assigned_to="dex")
+    barrier = Barrier(2)
+    with TestClient(create_app(database_path)) as other:
+        def attempt(api):
+            barrier.wait(timeout=5)
+            return claim(api, task, agent_id="dex", key="same-concurrent-claim")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(attempt, [client, other]))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert responses[0].json() == responses[1].json()
+    assert sorted(
+        response.headers["Idempotency-Replayed"] for response in responses
+    ) == ["false", "true"]
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM events WHERE task_id=? AND type='task.started'",
+            (task["id"],),
+        ).fetchone() == (1,)
+        assert connection.execute(
+            """SELECT count(*) FROM idempotency_records
+            WHERE key='same-concurrent-claim'"""
+        ).fetchone() == (1,)
 
 
 @pytest.mark.parametrize("decision", ["approve", "reject"])

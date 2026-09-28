@@ -575,7 +575,24 @@ def claim_task(
             (request.agent_id, now, now, str(task_id), request.agent_id),
         )
         if updated.rowcount != 1:
-            raise TaskStateConflict(TaskStatus.READY, TaskStatus(row["status"]))
+            current = connection.execute(
+                "SELECT status, assigned_to FROM tasks WHERE id = ?",
+                (str(task_id),),
+            ).fetchone()
+            if current is None:
+                raise TaskNotFound
+            current_status = TaskStatus(current["status"])
+            if current_status is not TaskStatus.READY:
+                raise TaskStateConflict(TaskStatus.READY, current_status)
+            if (
+                current["assigned_to"] is not None
+                and current["assigned_to"] != request.agent_id
+            ):
+                raise TaskAssignmentConflict(
+                    request.agent_id,
+                    current["assigned_to"],
+                )
+            raise RuntimeError("Claim acquisition failed without a domain conflict.")
 
         task = _task_from_row(
             connection.execute("SELECT * FROM tasks WHERE id = ?", (str(task_id),)).fetchone()
