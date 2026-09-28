@@ -133,6 +133,11 @@ oferece comandos de decisão de Approval. Consulte
 [`docs/agent-runner.md`](docs/agent-runner.md) para contrato, recuperação e
 operação.
 
+O primeiro executor real disponível é o `OpenAIAgentsExecutor`, isolado do
+AgentBus e executado em sandbox OpenAI-hosted sem rede. A integração é opt-in e
+exige somente `OPENAI_API_KEY` no ambiente do processo do adapter. Consulte
+[`docs/openai-agents-executor.md`](docs/openai-agents-executor.md).
+
 ## Testes
 
 ```bash
