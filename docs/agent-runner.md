@@ -16,6 +16,10 @@ Cada journal cria uma vez e preserva um `runner_instance_id`. Um lock exclusivo
 no arquivo impede duas cópias de abrirem o mesmo journal simultaneamente.
 Instâncias diferentes usam journals e chaves de claim diferentes.
 
+O lock é implementado com `fcntl.flock`. Portanto, o Runner deste slice requer
+um ambiente POSIX compatível, como Linux, e não oferece suporte a Windows. Uma
+abstração de locking multiplataforma fica deliberadamente fora deste slice.
+
 Uma linha de execução preserva somente fatos locais:
 
 - `claim_key` e `execution_id`, gravados antes do claim;
