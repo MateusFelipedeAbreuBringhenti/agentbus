@@ -64,6 +64,24 @@ def create_server(control: OrionOpsControlPlane) -> MCPServer:
         """Request human Approval for one ready Task; this never decides the Approval."""
         return control.request_approval(command)
 
+    # mcp 2.2 generates a Pydantic model for each function envelope with the
+    # default `extra=ignore`. Close that envelope as well as the nested command
+    # model so undeclared fields are rejected instead of silently discarded.
+    # The SDK currently exposes no public switch for this behavior.
+    for tool_name in (
+        "create_task",
+        "get_task",
+        "get_task_events",
+        "get_approval",
+        "list_task_approvals",
+        "request_approval",
+    ):
+        tool = server._tool_manager.get_tool(tool_name)
+        assert tool is not None
+        tool.fn_metadata.arg_model.model_config["extra"] = "forbid"
+        tool.fn_metadata.arg_model.model_rebuild(force=True)
+        tool.parameters = tool.fn_metadata.arg_model.model_json_schema()
+
     return server
 
 

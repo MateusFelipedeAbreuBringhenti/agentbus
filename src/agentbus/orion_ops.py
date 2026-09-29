@@ -6,7 +6,9 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
+from .models import ApprovalRead, EventRead, RequestApprovalResult, TaskRead
 
 
 ACTOR_LABEL = "orion-ops"
@@ -160,9 +162,13 @@ class OrionOpsControlPlane:
             detail = response.body.get("detail", {}) if isinstance(response.body, dict) else {}
             if isinstance(detail, str):
                 code, message = "agentbus_error", detail
-            else:
+            elif isinstance(detail, dict):
                 code = detail.get("code", "agentbus_error")
                 message = detail.get("message", f"AgentBus returned HTTP {response.status_code}.")
+                if not isinstance(code, str) or not isinstance(message, str):
+                    raise self._invalid_response("AgentBus error code/message is not text.")
+            else:
+                raise self._invalid_response("AgentBus error detail has an invalid shape.")
             raise OrionOpsError(response.status_code, code, message, detail)
         etags = {
             key.replace("-", "_"): value
@@ -174,27 +180,96 @@ class OrionOpsControlPlane:
             http=ToolHttpMetadata(status=response.status_code, **etags),
         )
 
+    @staticmethod
+    def _invalid_response(error: Exception | str) -> OrionOpsError:
+        detail = str(error)
+        return OrionOpsError(
+            502,
+            "invalid_agentbus_response",
+            "AgentBus returned a response that violates its contract.",
+            detail,
+        )
+
+    @classmethod
+    def _task_result(cls, result: ToolResult, *, mutation: bool = False) -> ToolResult:
+        try:
+            task = TaskRead.model_validate(result.data)
+        except ValidationError as error:
+            raise cls._invalid_response(error) from error
+        expected = f'"v{task.version}"'
+        if result.http.etag != expected:
+            raise cls._invalid_response(f"Expected ETag {expected}, got {result.http.etag!r}.")
+        if mutation and result.http.idempotency_replayed not in {"true", "false"}:
+            raise cls._invalid_response("Mutation response omitted Idempotency-Replayed.")
+        return ToolResult(data=task.model_dump(mode="json"), http=result.http)
+
+    @classmethod
+    def _approval_result(cls, result: ToolResult) -> ToolResult:
+        try:
+            approval = ApprovalRead.model_validate(result.data)
+        except ValidationError as error:
+            raise cls._invalid_response(error) from error
+        expected = f'"v{approval.version}"'
+        if result.http.etag != expected:
+            raise cls._invalid_response(f"Expected ETag {expected}, got {result.http.etag!r}.")
+        return ToolResult(data=approval.model_dump(mode="json"), http=result.http)
+
     def create_task(self, command: CreateTaskInput) -> ToolResult:
         body = command.model_dump(mode="json", exclude={"idempotency_key"})
         body["requested_by"] = self.principal
-        return self._call(
-            "POST",
-            "/tasks",
-            body=body,
-            headers={"Idempotency-Key": command.idempotency_key},
+        result = self._task_result(
+            self._call(
+                "POST",
+                "/tasks",
+                body=body,
+                headers={"Idempotency-Key": command.idempotency_key},
+            ),
+            mutation=True,
         )
+        if (
+            result.data["requested_by"] != self.principal
+            or result.data["correlation_id"] != str(command.correlation_id)
+        ):
+            raise self._invalid_response("Created Task identity or correlation does not match.")
+        return result
 
     def get_task(self, command: ResourceIdInput) -> ToolResult:
-        return self._call("GET", f"/tasks/{command.id}")
+        result = self._task_result(self._call("GET", f"/tasks/{command.id}"))
+        if result.data["id"] != str(command.id):
+            raise self._invalid_response("AgentBus returned a different Task id.")
+        return result
 
     def get_task_events(self, command: TaskIdInput) -> ToolResult:
-        return self._call("GET", f"/tasks/{command.task_id}/events")
+        result = self._call("GET", f"/tasks/{command.task_id}/events")
+        try:
+            events = TypeAdapter(list[EventRead]).validate_python(result.data)
+        except ValidationError as error:
+            raise self._invalid_response(error) from error
+        if any(event.task_id != command.task_id for event in events):
+            raise self._invalid_response("AgentBus returned an Event for another Task.")
+        return ToolResult(
+            data=[event.model_dump(mode="json") for event in events],
+            http=result.http,
+        )
 
     def get_approval(self, command: ResourceIdInput) -> ToolResult:
-        return self._call("GET", f"/approvals/{command.id}")
+        result = self._approval_result(self._call("GET", f"/approvals/{command.id}"))
+        if result.data["id"] != str(command.id):
+            raise self._invalid_response("AgentBus returned a different Approval id.")
+        return result
 
     def list_task_approvals(self, command: TaskIdInput) -> ToolResult:
-        return self._call("GET", f"/tasks/{command.task_id}/approvals")
+        result = self._call("GET", f"/tasks/{command.task_id}/approvals")
+        try:
+            approvals = TypeAdapter(list[ApprovalRead]).validate_python(result.data)
+        except ValidationError as error:
+            raise self._invalid_response(error) from error
+        if any(approval.task_id != command.task_id for approval in approvals):
+            raise self._invalid_response("AgentBus returned an Approval for another Task.")
+        return ToolResult(
+            data=[approval.model_dump(mode="json") for approval in approvals],
+            http=result.http,
+        )
 
     def request_approval(self, command: RequestApprovalInput) -> ToolResult:
         body = command.model_dump(
@@ -202,7 +277,7 @@ class OrionOpsControlPlane:
             exclude={"task_id", "if_match", "idempotency_key"},
         )
         body["requested_by"] = self.principal
-        return self._call(
+        result = self._call(
             "POST",
             f"/tasks/{command.task_id}/request-approval",
             body=body,
@@ -211,3 +286,24 @@ class OrionOpsControlPlane:
                 "If-Match": command.if_match,
             },
         )
+        try:
+            payload = RequestApprovalResult.model_validate(result.data)
+        except ValidationError as error:
+            raise self._invalid_response(error) from error
+        expected_task = f'"v{payload.task.version}"'
+        expected_approval = f'"v{payload.approval.version}"'
+        if (
+            result.http.task_etag != expected_task
+            or result.http.approval_etag != expected_approval
+            or result.http.idempotency_replayed not in {"true", "false"}
+        ):
+            raise self._invalid_response("Approval response metadata is missing or inconsistent.")
+        if (
+            payload.task.id != command.task_id
+            or payload.approval.task_id != command.task_id
+            or payload.task.correlation_id != payload.approval.correlation_id
+            or payload.task.waiting_on_approval_id != payload.approval.id
+            or payload.approval.requested_by != self.principal
+        ):
+            raise self._invalid_response("Approval response crosses Task or coordinator identity.")
+        return ToolResult(data=payload.model_dump(mode="json"), http=result.http)

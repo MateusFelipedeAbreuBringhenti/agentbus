@@ -43,6 +43,15 @@ The MCP allowlist prevents the model from acquiring worker/decision capabilities
 OS-level process isolation remains the boundary for denying access to unrelated
 host files.
 
+The opt-in heartbeat used `codex exec --sandbox read-only` in a disposable working
+directory and the observed turn called only Orion-ops MCP tools. This proves the
+MCP route did not transport Task/result content through Mateus. It does **not**
+prove that the surrounding Codex process lacked its built-in shell or could not
+read other host paths: `read-only` constrains writes, not general host readability.
+A persistent unattended Orion-ops deployment therefore still requires a dedicated
+OS/container boundary (or another officially supported MCP-only host) before it can
+claim “no generic Dell access.” Prompt instructions are not that boundary.
+
 ```toml
 [mcp_servers.orion-ops]
 enabled_tools = [
@@ -56,6 +65,18 @@ enabled_tools = [
 required = true
 default_tools_approval_mode = "approve"
 ```
+
+`approve` means calls to every tool that survives this server's `enabled_tools`
+allowlist proceed without a per-call human prompt. It does not enable another MCP
+tool, add shell/filesystem/HTTP access, change the Codex command sandbox, or grant
+an AgentBus operation that the bridge does not implement. Adding a new tool to the
+server later would put it under this default, so the allowlist and exported tool
+catalog must be reviewed together.
+
+The bridge is pinned to MCP Python SDK 2.2.x because it closes both the nested
+command schema and the SDK-generated function envelope at runtime. The latter
+currently requires a small private SDK hook; upgrading MCP must rerun the schema
+and smuggled-field tests before changing that pin.
 
 ## Protocol details
 
