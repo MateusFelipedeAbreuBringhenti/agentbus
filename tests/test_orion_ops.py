@@ -186,6 +186,7 @@ def test_agentbus_domain_error_is_translated_without_losing_code():
         control.get_task(ResourceIdInput(id=uuid4()))
     assert captured.value.status_code == 409
     assert captured.value.code == "idempotency_key_reused"
+    assert "[idempotency_key_reused]" in str(captured.value)
 
 
 @pytest.mark.parametrize(

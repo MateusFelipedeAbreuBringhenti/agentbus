@@ -15,7 +15,7 @@ PERSONA_VERSION = "orion-ops/v1"
 
 class OrionOpsError(RuntimeError):
     def __init__(self, status_code: int, code: str, message: str, detail: Any = None) -> None:
-        super().__init__(message)
+        super().__init__(f"AgentBus HTTP {status_code} [{code}]: {message}")
         self.status_code = status_code
         self.code = code
         self.message = message

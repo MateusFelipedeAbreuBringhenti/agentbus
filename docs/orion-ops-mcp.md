@@ -35,10 +35,27 @@ server rejects a non-loopback AgentBus URL, credentials in the URL, queries, and
 fragments. No API key is used.
 
 For a dedicated Orion-ops session, enable only these six tools in the Codex MCP
-configuration. Run it in a disposable working directory with no repository data.
+configuration and set `default_tools_approval_mode = "approve"` for this trusted,
+closed local server. Without that setting a non-interactive `approval = "never"`
+session correctly refuses mutating MCP calls instead of silently approving them.
+Run it in a disposable working directory with no repository data.
 The MCP allowlist prevents the model from acquiring worker/decision capabilities;
 OS-level process isolation remains the boundary for denying access to unrelated
 host files.
+
+```toml
+[mcp_servers.orion-ops]
+enabled_tools = [
+  "create_task",
+  "get_task",
+  "get_task_events",
+  "get_approval",
+  "list_task_approvals",
+  "request_approval",
+]
+required = true
+default_tools_approval_mode = "approve"
+```
 
 ## Protocol details
 
