@@ -7,7 +7,9 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from .orion_ops import (
+    CorrelationIdInput,
     CreateTaskInput,
+    CreateSuccessorInput,
     HttpControlTransport,
     OrionOpsControlPlane,
     RequestApprovalInput,
@@ -15,6 +17,7 @@ from .orion_ops import (
     TaskIdInput,
     ToolResult,
 )
+from .coordinator import CoordinatorOutbox
 
 
 CHARTER = """You are Orion-ops, a local operational coordinator, not hosted Orion.
@@ -38,6 +41,16 @@ def create_server(control: OrionOpsControlPlane) -> MCPServer:
     def create_task(command: CreateTaskInput) -> ToolResult:
         """Create one controlled AgentBus Task as the configured Orion-ops principal."""
         return control.create_task(command)
+
+    @server.tool(annotations=mutating, structured_output=True)
+    def create_successor_task(command: CreateSuccessorInput) -> ToolResult:
+        """Create a durable causal successor of one succeeded Task."""
+        return control.create_successor_task(command)
+
+    @server.tool(annotations=read_only, structured_output=True)
+    def get_correlation_trace(command: CorrelationIdInput) -> ToolResult:
+        """Read Tasks and Events in one correlation without inferring workflow state."""
+        return control.get_correlation_trace(command)
 
     @server.tool(annotations=read_only, structured_output=True)
     def get_task(command: ResourceIdInput) -> ToolResult:
@@ -70,6 +83,8 @@ def create_server(control: OrionOpsControlPlane) -> MCPServer:
     # The SDK currently exposes no public switch for this behavior.
     for tool_name in (
         "create_task",
+        "create_successor_task",
+        "get_correlation_trace",
         "get_task",
         "get_task_events",
         "get_approval",
@@ -89,7 +104,10 @@ def main() -> None:
     instance_id = UUID(os.environ["AGENTBUS_ORION_OPS_INSTANCE_ID"])
     transport = HttpControlTransport(os.environ.get("AGENTBUS_URL", "http://127.0.0.1:8000"))
     try:
-        control = OrionOpsControlPlane(transport, instance_id=instance_id)
+        outbox = CoordinatorOutbox(
+            os.environ.get("AGENTBUS_ORION_OPS_JOURNAL", "orion-ops.sqlite3")
+        )
+        control = OrionOpsControlPlane(transport, instance_id=instance_id, outbox=outbox)
         create_server(control).run(transport="stdio")
     finally:
         transport.close()

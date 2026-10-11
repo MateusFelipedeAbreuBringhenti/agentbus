@@ -14,7 +14,9 @@ from fastapi.testclient import TestClient
 
 from agentbus.app import create_app
 from agentbus.orion_ops import (
+    CorrelationIdInput,
     CreateTaskInput,
+    CreateSuccessorInput,
     ControlResponse,
     HttpControlTransport,
     OrionOpsControlPlane,
@@ -23,6 +25,7 @@ from agentbus.orion_ops import (
     ResourceIdInput,
     TaskIdInput,
 )
+from agentbus.coordinator import CoordinatorOutbox
 from agentbus.orion_ops_mcp import create_server
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -50,6 +53,19 @@ class AppClientTransport:
             response.json() if response.content else None,
             {key.lower(): value for key, value in response.headers.items()},
         )
+
+
+class LoseSuccessorResponseTransport:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.lost = False
+
+    def request(self, method, path, *, json=None, headers=None):
+        response = self.wrapped.request(method, path, json=json, headers=headers)
+        if method == "POST" and path.endswith("/successors") and not self.lost:
+            self.lost = True
+            raise RuntimeError("response lost after AgentBus commit")
+        return response
 
 
 def task_response(
@@ -163,6 +179,100 @@ def test_identity_and_generic_transport_fields_are_structurally_rejected():
         with pytest.raises(ValidationError):
             CreateTaskInput.model_validate({**base, forbidden: "attacker"})
 
+    successor = {
+        "coordination_id": str(uuid4()),
+        "predecessor_task_id": str(uuid4()),
+        "type": "consumer",
+        "title": "Consume",
+    }
+    for forbidden in ("requested_by", "correlation_id", "causation_event_id", "idempotency_key"):
+        with pytest.raises(ValidationError):
+            CreateSuccessorInput.model_validate({**successor, forbidden: "attacker"})
+
+
+def test_successor_control_uses_durable_outbox_and_server_owned_causality(tmp_path):
+    database = tmp_path / "bus.sqlite3"
+    instance = uuid4()
+    with TestClient(create_app(database)) as api:
+        principal = f"local-coordinator:{instance}"
+        root = api.post(
+            "/tasks",
+            json={
+                "type": "producer", "title": "Produce", "input": {},
+                "requested_by": principal, "assigned_to": "worker-a",
+                "correlation_id": str(uuid4()),
+            },
+            headers={"Idempotency-Key": "root"},
+        ).json()
+        api.post(
+            f"/tasks/{root['id']}/claim", json={"agent_id": "worker-a"},
+            headers={"Idempotency-Key": "claim"},
+        )
+        api.post(
+            f"/tasks/{root['id']}/complete", json={"output": {"artifact": "ok"}},
+            headers={"Idempotency-Key": "complete", "If-Match": '"v2"'},
+        )
+        command = CreateSuccessorInput(
+            coordination_id=uuid4(), predecessor_task_id=root["id"],
+            type="consumer", title="Consume", input={"artifact": "ok"},
+            assigned_to="worker-b",
+        )
+        outbox_path = tmp_path / "outbox.sqlite3"
+        first = OrionOpsControlPlane(
+            AppClientTransport(api), instance_id=instance,
+            outbox=CoordinatorOutbox(outbox_path),
+        ).create_successor_task(command)
+        replay = OrionOpsControlPlane(
+            AppClientTransport(api), instance_id=instance,
+            outbox=CoordinatorOutbox(outbox_path),
+        ).create_successor_task(command)
+        assert first.data == replay.data
+        assert replay.http.idempotency_replayed == "true"
+        trace = OrionOpsControlPlane(
+            AppClientTransport(api), instance_id=instance,
+        ).get_correlation_trace(CorrelationIdInput(correlation_id=root["correlation_id"]))
+        assert [task["id"] for task in trace.data["tasks"]] == [root["id"], first.data["id"]]
+
+
+def test_successor_response_loss_replays_persisted_outbox_decision(tmp_path):
+    database, instance = tmp_path / "bus.sqlite3", uuid4()
+    with TestClient(create_app(database)) as api:
+        principal = f"local-coordinator:{instance}"
+        root = api.post(
+            "/tasks",
+            json={
+                "type": "producer", "title": "Produce", "input": {},
+                "requested_by": principal, "assigned_to": "worker-a",
+                "correlation_id": str(uuid4()),
+            }, headers={"Idempotency-Key": "lost-root"},
+        ).json()
+        api.post(
+            f"/tasks/{root['id']}/claim", json={"agent_id": "worker-a"},
+            headers={"Idempotency-Key": "lost-claim"},
+        )
+        api.post(
+            f"/tasks/{root['id']}/complete", json={"output": {"artifact": "ok"}},
+            headers={"Idempotency-Key": "lost-complete", "If-Match": '"v2"'},
+        )
+        command = CreateSuccessorInput(
+            coordination_id=uuid4(), predecessor_task_id=root["id"],
+            type="consumer", title="Consume", input={"artifact": "ok"},
+            assigned_to="worker-b",
+        )
+        outbox_path = tmp_path / "lost-outbox.sqlite3"
+        with pytest.raises(RuntimeError, match="response lost"):
+            OrionOpsControlPlane(
+                LoseSuccessorResponseTransport(AppClientTransport(api)),
+                instance_id=instance, outbox=CoordinatorOutbox(outbox_path),
+            ).create_successor_task(command)
+        recovered = OrionOpsControlPlane(
+            AppClientTransport(api), instance_id=instance,
+            outbox=CoordinatorOutbox(outbox_path),
+        ).create_successor_task(command)
+        assert recovered.http.idempotency_replayed == "true"
+        trace = api.get(f"/correlations/{root['correlation_id']}/trace").json()
+        assert len(trace["tasks"]) == 2
+
 
 def test_mcp_exports_exact_allowlist_with_closed_command_schemas():
     transport = FakeTransport([])
@@ -171,6 +281,8 @@ def test_mcp_exports_exact_allowlist_with_closed_command_schemas():
 
     assert {tool.name for tool in tools} == {
         "create_task",
+        "create_successor_task",
+        "get_correlation_trace",
         "get_task",
         "get_task_events",
         "get_approval",
