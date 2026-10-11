@@ -16,6 +16,7 @@ from agentbus.models import (
     ApprovalRead,
     ApprovalStatus,
     EventRead,
+    CorrelationTrace,
     RequestApproval,
     RequestApprovalResult,
     TaskClaim,
@@ -24,6 +25,7 @@ from agentbus.models import (
     TaskFail,
     TaskRead,
     TaskRelease,
+    SuccessorTaskCreate,
 )
 from agentbus.service import (
     ApprovalCorrelationMismatch,
@@ -36,6 +38,8 @@ from agentbus.service import (
     CausationEventNotFound,
     IdempotencyConflict,
     PendingApprovalConflict,
+    PredecessorCompletionEventInvalid,
+    PredecessorNotSucceeded,
     TaskNotFound,
     TaskAssignmentConflict,
     TaskStateConflict,
@@ -43,6 +47,7 @@ from agentbus.service import (
     claim_task,
     complete_task,
     create_task,
+    create_successor_task,
     decide_approval,
     fail_task,
     get_approval,
@@ -50,6 +55,7 @@ from agentbus.service import (
     get_task,
     get_task_approvals,
     get_task_events,
+    get_correlation_trace,
     release_task,
     request_task_approval,
 )
@@ -140,6 +146,31 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
 
     app = FastAPI(title="AgentBus", version="0.1.0", lifespan=lifespan)
     app.state.database = database
+
+    @app.exception_handler(PredecessorNotSucceeded)
+    async def predecessor_not_succeeded_handler(
+        _: Request, error: PredecessorNotSucceeded,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": {
+                "code": "predecessor_not_succeeded",
+                "message": "A successor requires a succeeded predecessor.",
+                "actual": error.actual.value,
+            }},
+        )
+
+    @app.exception_handler(PredecessorCompletionEventInvalid)
+    async def predecessor_completion_event_invalid_handler(
+        _: Request, __: PredecessorCompletionEventInvalid,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": {
+                "code": "predecessor_completion_event_invalid",
+                "message": "The predecessor has no unique matching completion Event.",
+            }},
+        )
 
     @app.exception_handler(IdempotencyConflict)
     async def idempotency_conflict_handler(
@@ -376,6 +407,29 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         if task is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
         return _task_response(task, status_code=status.HTTP_200_OK)
+
+    @app.post(
+        "/tasks/{task_id}/successors",
+        response_model=TaskRead,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_successor_task_endpoint(
+        task_id: UUID,
+        command: SuccessorTaskCreate,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=1, max_length=200,
+        ),
+    ) -> JSONResponse:
+        result = create_successor_task(database, task_id, command, idempotency_key)
+        return _task_response(
+            result.task,
+            status_code=status.HTTP_201_CREATED,
+            replayed=result.replayed,
+        )
+
+    @app.get("/correlations/{correlation_id}/trace", response_model=CorrelationTrace)
+    def get_correlation_trace_endpoint(correlation_id: UUID) -> CorrelationTrace:
+        return get_correlation_trace(database, correlation_id)
 
     @app.get("/agents/{agent_id}/inbox", response_model=AgentInbox)
     def get_agent_inbox_endpoint(agent_id: str) -> AgentInbox:
