@@ -34,7 +34,8 @@ codex mcp add orion-ops \
 
 Do not commit the chosen instance UUID or a machine-specific absolute path. The
 server rejects a non-loopback AgentBus URL, credentials in the URL, queries, and
-fragments. No API key is used.
+fragments. The journal setting is required and must be an absolute path on durable
+local storage. No API key is used.
 
 For a dedicated Orion-ops session, enable only these eight tools in the Codex MCP
 configuration and set `default_tools_approval_mode = "approve"` for this trusted,
@@ -92,6 +93,8 @@ returned with their stable error code rather than converted to a generic success
 The successor tool is the exception to caller-supplied idempotency keys: it accepts a stable
 `coordination_id`, persists the exact decision in the configured outbox, and generates the
 AgentBus key once. It does not accept identity, correlation, or causation from the model.
+Before serving MCP traffic after a restart, Orion-ops automatically replays unconfirmed
+successor rows. A failed replay stops startup rather than discarding or regenerating a decision.
 
 If an Approval appears, Orion-ops may read and present it, then must stop. There is
 no `approve` or `reject` tool.

@@ -138,3 +138,12 @@ class CoordinatorOutbox:
                 ),
             )
             connection.commit()
+
+    def pending(self) -> list[SuccessorCommand]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT * FROM successor_commands
+                WHERE confirmed_at IS NULL
+                ORDER BY created_at, coordination_id"""
+            ).fetchall()
+        return [self._record(row) for row in rows]

@@ -15,6 +15,7 @@ def test_outbox_persists_key_and_exact_payload_across_restart(tmp_path):
     replay = CoordinatorOutbox(path).prepare(coordination, parent, body)
     assert replay.idempotency_key == first.idempotency_key
     assert replay.request_json == first.request_json
+    assert CoordinatorOutbox(path).pending() == [replay]
 
 
 def test_outbox_rejects_divergent_decision(tmp_path):
@@ -45,5 +46,6 @@ def test_confirmation_is_retained_and_cannot_switch_successor(tmp_path):
     record = outbox.prepare(coordination, parent, {"title": "same"})
     assert record.successor_task_id == successor
     assert record.confirmed_at is not None
+    assert outbox.pending() == []
     with pytest.raises(CoordinationDecisionConflict):
         outbox.confirm(coordination, uuid4(), {"id": "different"})

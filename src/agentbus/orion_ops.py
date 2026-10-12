@@ -10,7 +10,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from .models import ApprovalRead, CorrelationTrace, EventRead, RequestApprovalResult, TaskRead
-from .coordinator import CoordinatorOutbox
+from .coordinator import CoordinatorOutbox, SuccessorCommand
 
 
 ACTOR_LABEL = "orion-ops"
@@ -263,7 +263,6 @@ class OrionOpsControlPlane:
     def create_successor_task(self, command: CreateSuccessorInput) -> ToolResult:
         if self._outbox is None:
             raise RuntimeError("Coordinator outbox is required for successor commands.")
-        parent = self.get_task(ResourceIdInput(id=command.predecessor_task_id))
         body = command.model_dump(
             mode="json", exclude={"coordination_id", "predecessor_task_id"}
         )
@@ -271,11 +270,20 @@ class OrionOpsControlPlane:
         prepared = self._outbox.prepare(
             command.coordination_id, command.predecessor_task_id, body
         )
+        return self._send_successor(prepared)
+
+    def _send_successor(self, prepared: SuccessorCommand) -> ToolResult:
+        if self._outbox is None:
+            raise RuntimeError("Coordinator outbox is required for successor commands.")
+        body = json.loads(prepared.request_json)
+        if body.get("requested_by") != self.principal:
+            raise RuntimeError("Pending successor belongs to another coordinator principal.")
+        parent = self.get_task(ResourceIdInput(id=prepared.predecessor_task_id))
         result = self._task_result(
             self._call(
                 "POST",
-                f"/tasks/{command.predecessor_task_id}/successors",
-                body=json.loads(prepared.request_json),
+                f"/tasks/{prepared.predecessor_task_id}/successors",
+                body=body,
                 headers={"Idempotency-Key": prepared.idempotency_key},
             ),
             mutation=True,
@@ -288,9 +296,14 @@ class OrionOpsControlPlane:
                 "Successor identity or inherited correlation does not match."
             )
         self._outbox.confirm(
-            command.coordination_id, UUID(result.data["id"]), result.data
+            prepared.coordination_id, UUID(result.data["id"]), result.data
         )
         return result
+
+    def recover_pending_successors(self) -> list[ToolResult]:
+        if self._outbox is None:
+            raise RuntimeError("Coordinator outbox is required for successor recovery.")
+        return [self._send_successor(command) for command in self._outbox.pending()]
 
     def get_correlation_trace(self, command: CorrelationIdInput) -> ToolResult:
         result = self._call("GET", f"/correlations/{command.correlation_id}/trace")

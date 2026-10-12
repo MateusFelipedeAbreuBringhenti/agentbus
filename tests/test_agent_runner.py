@@ -9,6 +9,13 @@ from fastapi.testclient import TestClient
 import pytest
 
 from agentbus.app import create_app
+from agentbus.coordinator import CoordinatorOutbox
+from agentbus.orion_ops import (
+    ControlResponse,
+    CreateTaskInput,
+    CreateSuccessorInput,
+    OrionOpsControlPlane,
+)
 from agentbus.runner import (
     AgentBusTransportError,
     AgentRunner,
@@ -84,6 +91,19 @@ class TestAgentBusClient:
                     "If-Match": if_match,
                 },
             )
+        )
+
+
+class IntegrationControlTransport:
+    def __init__(self, api: TestClient) -> None:
+        self.api = api
+
+    def request(self, method, path, *, json=None, headers=None):
+        response = self.api.request(method, path, json=json, headers=headers)
+        return ControlResponse(
+            response.status_code,
+            response.json() if response.content else None,
+            {key.lower(): value for key, value in response.headers.items()},
         )
 
 
@@ -499,7 +519,17 @@ def test_approval_item_is_structurally_ignored(api, tmp_path):
 
 
 def test_two_worker_causal_heartbeat_recovers_lost_completion(api, tmp_path):
-    producer_task = create_task(api, assigned_to="worker-a")
+    coordinator = OrionOpsControlPlane(
+        IntegrationControlTransport(api), instance_id=uuid4(),
+        outbox=CoordinatorOutbox(tmp_path / "coordinator.sqlite3"),
+    )
+    producer_task = coordinator.create_task(
+        CreateTaskInput(
+            type="artifact-producer", title="Produce artifact",
+            input={"a": "A", "b": "B"}, assigned_to="worker-a",
+            correlation_id=uuid4(), idempotency_key="heartbeat-producer",
+        )
+    ).data
     base_client = TestAgentBusClient(api)
     lossy_client = LoseConfirmedResponseClient(base_client, "complete")
     with RunnerJournal(tmp_path / "producer.sqlite3") as producer_journal:
@@ -514,16 +544,14 @@ def test_two_worker_causal_heartbeat_recovers_lost_completion(api, tmp_path):
         assert producer_journal.get(producer_task["id"]).reported_at is not None
 
     completed_parent = api.get(f"/tasks/{producer_task['id']}").json()
-    successor = api.post(
-        f"/tasks/{producer_task['id']}/successors",
-        json={
-            "type": "artifact-consumer", "title": "Validate artifact",
-            "input": {"artifact": completed_parent["output"]["artifact"]},
-            "requested_by": "orion-ops", "assigned_to": "worker-b",
-        },
-        headers={"Idempotency-Key": "heartbeat-successor"},
+    successor = coordinator.create_successor_task(
+        CreateSuccessorInput(
+            coordination_id=uuid4(), predecessor_task_id=producer_task["id"],
+            type="artifact-consumer", title="Validate artifact",
+            input={"artifact": completed_parent["output"]["artifact"]},
+            assigned_to="worker-b",
+        )
     )
-    assert successor.status_code == 201
     with RunnerJournal(tmp_path / "consumer.sqlite3") as consumer_journal:
         consumer = AgentRunner(
             agent_id="worker-b", client=base_client,
@@ -531,7 +559,7 @@ def test_two_worker_causal_heartbeat_recovers_lost_completion(api, tmp_path):
         )
         consumer.poll_once()
 
-    child = api.get(f"/tasks/{successor.json()['id']}").json()
+    child = api.get(f"/tasks/{successor.data['id']}").json()
     assert child["status"] == "succeeded"
     assert child["output"]["validated_sha256"] == completed_parent["output"]["artifact"]["sha256"]
     trace = api.get(f"/correlations/{producer_task['correlation_id']}/trace").json()

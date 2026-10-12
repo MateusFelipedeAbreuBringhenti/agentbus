@@ -27,6 +27,12 @@ Set `AGENTBUS_ORION_OPS_JOURNAL` to a durable local SQLite path. Sharing that fi
 for coordinator instances that must represent the same decision. Different coordination ids
 represent independent decisions and may legitimately create different successors.
 
+The MCP process requires this setting to be an absolute path. On startup it enumerates every
+unconfirmed row and resends the stored body and key before accepting MCP traffic. Recovery does
+not ask the model or human to repeat the operation. If AgentBus is unavailable or a pending row
+belongs to another configured principal, startup fails closed; the process supervisor may
+restart it after the condition is corrected. This is startup recovery, not a scheduler.
+
 AgentBus currently retains idempotency records indefinitely: there is no TTL or cleanup path.
 This is current storage policy, not a promise that replay may be garbage-collected without a
 future retention contract. Any future cleanup must preserve at least the maximum outbox

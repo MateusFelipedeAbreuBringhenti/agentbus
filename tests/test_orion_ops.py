@@ -265,11 +265,15 @@ def test_successor_response_loss_replays_persisted_outbox_decision(tmp_path):
                 LoseSuccessorResponseTransport(AppClientTransport(api)),
                 instance_id=instance, outbox=CoordinatorOutbox(outbox_path),
             ).create_successor_task(command)
-        recovered = OrionOpsControlPlane(
+        recovered_control = OrionOpsControlPlane(
             AppClientTransport(api), instance_id=instance,
             outbox=CoordinatorOutbox(outbox_path),
-        ).create_successor_task(command)
+        )
+        recovered_results = recovered_control.recover_pending_successors()
+        assert len(recovered_results) == 1
+        recovered = recovered_results[0]
         assert recovered.http.idempotency_replayed == "true"
+        assert recovered_control.recover_pending_successors() == []
         trace = api.get(f"/correlations/{root['correlation_id']}/trace").json()
         assert len(trace["tasks"]) == 2
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from uuid import UUID
 
 from mcp.server.mcpserver import MCPServer
@@ -102,12 +103,14 @@ def create_server(control: OrionOpsControlPlane) -> MCPServer:
 
 def main() -> None:
     instance_id = UUID(os.environ["AGENTBUS_ORION_OPS_INSTANCE_ID"])
+    journal_path = Path(os.environ["AGENTBUS_ORION_OPS_JOURNAL"])
+    if not journal_path.is_absolute():
+        raise ValueError("AGENTBUS_ORION_OPS_JOURNAL must be an absolute durable path.")
     transport = HttpControlTransport(os.environ.get("AGENTBUS_URL", "http://127.0.0.1:8000"))
     try:
-        outbox = CoordinatorOutbox(
-            os.environ.get("AGENTBUS_ORION_OPS_JOURNAL", "orion-ops.sqlite3")
-        )
+        outbox = CoordinatorOutbox(journal_path)
         control = OrionOpsControlPlane(transport, instance_id=instance_id, outbox=outbox)
+        control.recover_pending_successors()
         create_server(control).run(transport="stdio")
     finally:
         transport.close()
