@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
 from pathlib import Path
 from threading import Barrier, Lock
 from uuid import UUID, uuid4
@@ -7,6 +9,13 @@ from fastapi.testclient import TestClient
 import pytest
 
 from agentbus.app import create_app
+from agentbus.coordinator import CoordinatorOutbox
+from agentbus.orion_ops import (
+    ControlResponse,
+    CreateTaskInput,
+    CreateSuccessorInput,
+    OrionOpsControlPlane,
+)
 from agentbus.runner import (
     AgentBusTransportError,
     AgentRunner,
@@ -82,6 +91,19 @@ class TestAgentBusClient:
                     "If-Match": if_match,
                 },
             )
+        )
+
+
+class IntegrationControlTransport:
+    def __init__(self, api: TestClient) -> None:
+        self.api = api
+
+    def request(self, method, path, *, json=None, headers=None):
+        response = self.api.request(method, path, json=json, headers=headers)
+        return ControlResponse(
+            response.status_code,
+            response.json() if response.content else None,
+            {key.lower(): value for key, value in response.headers.items()},
         )
 
 
@@ -172,6 +194,27 @@ class RecordingExecutor:
             self.interrupt_once = False
             raise RuntimeError("simulated executor interruption")
         return ExecutionSucceeded(output={"execution_id": str(request.execution_id)})
+
+
+class ArtifactProducer:
+    def execute(self, request: ExecutionRequest):
+        content = {"combined": "A+B"}
+        digest = hashlib.sha256(
+            json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        return ExecutionSucceeded(output={"artifact": {"content": content, "sha256": digest}})
+
+
+class ArtifactConsumer:
+    def execute(self, request: ExecutionRequest):
+        artifact = request.input["artifact"]
+        digest = hashlib.sha256(
+            json.dumps(
+                artifact["content"], separators=(",", ":"), sort_keys=True
+            ).encode()
+        ).hexdigest()
+        assert digest == artifact["sha256"]
+        return ExecutionSucceeded(output={"validated_sha256": digest, "derived": "A+B:ok"})
 
 
 class CountingExecutor:
@@ -473,3 +516,60 @@ def test_approval_item_is_structurally_ignored(api, tmp_path):
         assert journal.pending() == []
     assert executor.execution_ids == []
     assert api.get(f"/approvals/{approval_id}").json()["status"] == "pending"
+
+
+def test_two_worker_causal_heartbeat_recovers_lost_completion(api, tmp_path):
+    coordinator = OrionOpsControlPlane(
+        IntegrationControlTransport(api), instance_id=uuid4(),
+        outbox=CoordinatorOutbox(tmp_path / "coordinator.sqlite3"),
+    )
+    producer_task = coordinator.create_task(
+        CreateTaskInput(
+            type="artifact-producer", title="Produce artifact",
+            input={"a": "A", "b": "B"}, assigned_to="worker-a",
+            correlation_id=uuid4(), idempotency_key="heartbeat-producer",
+        )
+    ).data
+    base_client = TestAgentBusClient(api)
+    lossy_client = LoseConfirmedResponseClient(base_client, "complete")
+    with RunnerJournal(tmp_path / "producer.sqlite3") as producer_journal:
+        producer = AgentRunner(
+            agent_id="worker-a", client=lossy_client,
+            journal=producer_journal, executor=ArtifactProducer(),
+        )
+        producer.poll_once()
+        assert api.get(f"/tasks/{producer_task['id']}").json()["status"] == "succeeded"
+        assert producer_journal.get(producer_task["id"]).reported_at is None
+        producer.poll_once()
+        assert producer_journal.get(producer_task["id"]).reported_at is not None
+
+    completed_parent = api.get(f"/tasks/{producer_task['id']}").json()
+    successor = coordinator.create_successor_task(
+        CreateSuccessorInput(
+            coordination_id=uuid4(), predecessor_task_id=producer_task["id"],
+            type="artifact-consumer", title="Validate artifact",
+            input={"artifact": completed_parent["output"]["artifact"]},
+            assigned_to="worker-b",
+        )
+    )
+    with RunnerJournal(tmp_path / "consumer.sqlite3") as consumer_journal:
+        consumer = AgentRunner(
+            agent_id="worker-b", client=base_client,
+            journal=consumer_journal, executor=ArtifactConsumer(),
+        )
+        consumer.poll_once()
+
+    child = api.get(f"/tasks/{successor.data['id']}").json()
+    assert child["status"] == "succeeded"
+    assert child["output"]["validated_sha256"] == completed_parent["output"]["artifact"]["sha256"]
+    trace = api.get(f"/correlations/{producer_task['correlation_id']}/trace").json()
+    assert [task["id"] for task in trace["tasks"]] == [producer_task["id"], child["id"]]
+    child_created = next(
+        event for event in trace["events"]
+        if event["task_id"] == child["id"] and event["type"] == "task.created"
+    )
+    parent_completed = next(
+        event for event in trace["events"]
+        if event["task_id"] == producer_task["id"] and event["type"] == "task.completed"
+    )
+    assert child_created["causation_event_id"] == parent_completed["id"]

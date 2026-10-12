@@ -19,6 +19,8 @@ from agentbus.models import (
     InboxTaskItem,
     RequestApproval,
     RequestApprovalResult,
+    CorrelationTrace,
+    SuccessorTaskCreate,
     TaskClaim,
     TaskComplete,
     TaskCreate,
@@ -30,6 +32,7 @@ from agentbus.models import (
 
 
 CREATE_TASK_OPERATION = "POST:/tasks"
+CREATE_SUCCESSOR_OPERATION = "POST:/tasks/{task_id}/successors"
 CLAIM_TASK_OPERATION = "POST:/tasks/{task_id}/claim"
 COMPLETE_TASK_OPERATION = "POST:/tasks/{task_id}/complete"
 FAIL_TASK_OPERATION = "POST:/tasks/{task_id}/fail"
@@ -59,6 +62,15 @@ class TaskStateConflict(Exception):
     def __init__(self, expected: TaskStatus, actual: TaskStatus) -> None:
         self.expected = expected
         self.actual = actual
+
+
+class PredecessorNotSucceeded(Exception):
+    def __init__(self, actual: TaskStatus) -> None:
+        self.actual = actual
+
+
+class PredecessorCompletionEventInvalid(Exception):
+    """The succeeded predecessor has no unique matching completion Event."""
 
 
 class TaskVersionConflict(Exception):
@@ -282,6 +294,7 @@ def _store_idempotency_response(
     resource_id: UUID,
     response_body: str,
     created_at: str,
+    response_status: int = 200,
 ) -> None:
     connection.execute(
         """
@@ -289,7 +302,7 @@ def _store_idempotency_response(
             scope, key, request_hash, command_id, correlation_id,
             causation_event_id, resource_type, resource_id,
             response_status, response_body, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 200, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             scope,
@@ -300,6 +313,7 @@ def _store_idempotency_response(
             str(causation_event_id) if causation_event_id else None,
             resource_type,
             str(resource_id),
+            response_status,
             response_body,
             created_at,
         ),
@@ -530,6 +544,99 @@ def create_task(
             ),
         )
 
+        return CreateTaskResult(task=task, replayed=False)
+
+
+def create_successor_task(
+    database: Database,
+    predecessor_id: UUID,
+    request: SuccessorTaskCreate,
+    idempotency_key: str,
+) -> CreateTaskResult:
+    request_hash = _command_request_hash(predecessor_id, request)
+    scope = _command_scope(request.requested_by, CREATE_SUCCESSOR_OPERATION)
+
+    with database.transaction() as connection:
+        replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
+        if replayed is not None:
+            return CreateTaskResult(task=replayed, replayed=True)
+
+        predecessor_row = connection.execute(
+            "SELECT * FROM tasks WHERE id = ?", (str(predecessor_id),)
+        ).fetchone()
+        if predecessor_row is None:
+            raise TaskNotFound
+        predecessor = _task_from_row(predecessor_row)
+        if predecessor.status is not TaskStatus.SUCCEEDED:
+            raise PredecessorNotSucceeded(predecessor.status)
+
+        completion_events = connection.execute(
+            """
+            SELECT * FROM events
+            WHERE task_id = ? AND type = 'task.completed'
+              AND correlation_id = ?
+            ORDER BY sequence
+            """,
+            (str(predecessor_id), str(predecessor.correlation_id)),
+        ).fetchall()
+        if len(completion_events) != 1:
+            raise PredecessorCompletionEventInvalid
+        completion = _event_from_row(completion_events[0])
+        if completion.data.get("version") != predecessor.version:
+            raise PredecessorCompletionEventInvalid
+
+        task_id, command_id = uuid4(), uuid4()
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                id, type, title, description, input_json, output_json, status,
+                requested_by, assigned_to, failure_code, failure_message,
+                retry_of, correlation_id, version, created_at, updated_at,
+                started_at, finished_at, waiting_on_approval_id
+            ) VALUES (?, ?, ?, ?, ?, NULL, 'ready', ?, ?, NULL, NULL, NULL,
+                      ?, 1, ?, ?, NULL, NULL, NULL)
+            """,
+            (
+                str(task_id), request.type, request.title, request.description,
+                json.dumps(request.input, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+                request.requested_by, request.assigned_to,
+                str(predecessor.correlation_id), now_text, now_text,
+            ),
+        )
+        task = _task_from_row(
+            connection.execute("SELECT * FROM tasks WHERE id = ?", (str(task_id),)).fetchone()
+        )
+        _insert_task_event(
+            connection,
+            task=task,
+            event_type="task.created",
+            data={
+                "predecessor_task_id": str(predecessor.id),
+                "status": task.status.value,
+                "task_id": str(task.id),
+                "type": task.type,
+            },
+            actor_id=request.requested_by,
+            causation_event_id=completion.id,
+            command_id=command_id,
+            occurred_at=now_text,
+        )
+        _store_idempotency_response(
+            connection,
+            scope=scope,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            command_id=command_id,
+            correlation_id=task.correlation_id,
+            causation_event_id=completion.id,
+            resource_type="task",
+            resource_id=task.id,
+            response_body=task.model_dump_json(),
+            created_at=now_text,
+            response_status=201,
+        )
         return CreateTaskResult(task=task, replayed=False)
 
 
@@ -1148,7 +1255,27 @@ def get_task_events(database: Database, task_id: UUID) -> list[EventRead]:
             "SELECT * FROM events WHERE task_id = ? ORDER BY sequence",
             (str(task_id),),
         ).fetchall()
-    return [_event_from_row(row) for row in rows]
+        return [_event_from_row(row) for row in rows]
+
+
+def get_correlation_trace(database: Database, correlation_id: UUID) -> CorrelationTrace:
+    with closing(database.connect()) as connection:
+        connection.execute("BEGIN")
+        task_rows = connection.execute(
+            """SELECT * FROM tasks WHERE correlation_id = ?
+            ORDER BY created_at, id""",
+            (str(correlation_id),),
+        ).fetchall()
+        event_rows = connection.execute(
+            """SELECT * FROM events WHERE correlation_id = ?
+            ORDER BY occurred_at, task_id, sequence""",
+            (str(correlation_id),),
+        ).fetchall()
+    return CorrelationTrace(
+        correlation_id=correlation_id,
+        tasks=[_task_from_row(row) for row in task_rows],
+        events=[_event_from_row(row) for row in event_rows],
+    )
 
 
 def get_approval(database: Database, approval_id: UUID) -> ApprovalRead | None:

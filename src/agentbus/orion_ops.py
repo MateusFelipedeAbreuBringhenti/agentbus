@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Protocol
 from urllib.parse import urlparse
 from uuid import UUID
@@ -8,7 +9,8 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from .models import ApprovalRead, EventRead, RequestApprovalResult, TaskRead
+from .models import ApprovalRead, CorrelationTrace, EventRead, RequestApprovalResult, TaskRead
+from .coordinator import CoordinatorOutbox, SuccessorCommand
 
 
 ACTOR_LABEL = "orion-ops"
@@ -35,6 +37,24 @@ class CreateTaskInput(BaseModel):
     correlation_id: UUID
     causation_event_id: UUID | None = None
     idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class CreateSuccessorInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    coordination_id: UUID
+    predecessor_task_id: UUID
+    type: str = Field(min_length=1, max_length=100)
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=10_000)
+    input: dict[str, Any] = Field(default_factory=dict)
+    assigned_to: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class CorrelationIdInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    correlation_id: UUID
 
 
 class ResourceIdInput(BaseModel):
@@ -137,9 +157,16 @@ class HttpControlTransport:
 class OrionOpsControlPlane:
     """A closed, coordinator-only projection over the AgentBus HTTP API."""
 
-    def __init__(self, transport: ControlTransport, *, instance_id: UUID) -> None:
+    def __init__(
+        self,
+        transport: ControlTransport,
+        *,
+        instance_id: UUID,
+        outbox: CoordinatorOutbox | None = None,
+    ) -> None:
         self._transport = transport
         self.principal = f"local-coordinator:{instance_id}"
+        self._outbox = outbox
 
     @property
     def metadata(self) -> dict[str, str]:
@@ -232,6 +259,61 @@ class OrionOpsControlPlane:
         ):
             raise self._invalid_response("Created Task identity or correlation does not match.")
         return result
+
+    def create_successor_task(self, command: CreateSuccessorInput) -> ToolResult:
+        if self._outbox is None:
+            raise RuntimeError("Coordinator outbox is required for successor commands.")
+        body = command.model_dump(
+            mode="json", exclude={"coordination_id", "predecessor_task_id"}
+        )
+        body["requested_by"] = self.principal
+        prepared = self._outbox.prepare(
+            command.coordination_id, command.predecessor_task_id, body
+        )
+        return self._send_successor(prepared)
+
+    def _send_successor(self, prepared: SuccessorCommand) -> ToolResult:
+        if self._outbox is None:
+            raise RuntimeError("Coordinator outbox is required for successor commands.")
+        body = json.loads(prepared.request_json)
+        if body.get("requested_by") != self.principal:
+            raise RuntimeError("Pending successor belongs to another coordinator principal.")
+        parent = self.get_task(ResourceIdInput(id=prepared.predecessor_task_id))
+        result = self._task_result(
+            self._call(
+                "POST",
+                f"/tasks/{prepared.predecessor_task_id}/successors",
+                body=body,
+                headers={"Idempotency-Key": prepared.idempotency_key},
+            ),
+            mutation=True,
+        )
+        if (
+            result.data["requested_by"] != self.principal
+            or result.data["correlation_id"] != parent.data["correlation_id"]
+        ):
+            raise self._invalid_response(
+                "Successor identity or inherited correlation does not match."
+            )
+        self._outbox.confirm(
+            prepared.coordination_id, UUID(result.data["id"]), result.data
+        )
+        return result
+
+    def recover_pending_successors(self) -> list[ToolResult]:
+        if self._outbox is None:
+            raise RuntimeError("Coordinator outbox is required for successor recovery.")
+        return [self._send_successor(command) for command in self._outbox.pending()]
+
+    def get_correlation_trace(self, command: CorrelationIdInput) -> ToolResult:
+        result = self._call("GET", f"/correlations/{command.correlation_id}/trace")
+        try:
+            trace = CorrelationTrace.model_validate(result.data)
+        except ValidationError as error:
+            raise self._invalid_response(error) from error
+        if trace.correlation_id != command.correlation_id:
+            raise self._invalid_response("AgentBus returned another correlation trace.")
+        return ToolResult(data=trace.model_dump(mode="json"), http=result.http)
 
     def get_task(self, command: ResourceIdInput) -> ToolResult:
         result = self._task_result(self._call("GET", f"/tasks/{command.id}"))

@@ -34,6 +34,17 @@ class TaskCreate(BaseModel):
     causation_event_id: UUID | None = None
 
 
+class SuccessorTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(min_length=1, max_length=100)
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=10_000)
+    input: dict[str, Any] = Field(default_factory=dict)
+    requested_by: str = Field(min_length=1, max_length=200)
+    assigned_to: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 class TaskClaim(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -140,6 +151,12 @@ class EventRead(BaseModel):
     command_id: UUID
     event_index: int
     occurred_at: datetime
+
+
+class CorrelationTrace(BaseModel):
+    correlation_id: UUID
+    tasks: list[TaskRead]
+    events: list[EventRead]
 
 
 class InboxTaskItem(BaseModel):
