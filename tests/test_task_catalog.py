@@ -60,6 +60,15 @@ def test_task_catalog_cursor_is_bound_to_filters(tmp_path) -> None:
         assert response.json()["detail"]["code"] == "invalid_task_cursor"
 
 
+def test_task_catalog_rejects_malformed_cursor_as_domain_error(tmp_path) -> None:
+    app = create_app(tmp_path / "agentbus.sqlite3")
+    with TestClient(app) as client:
+        response = client.get("/tasks", params={"cursor": "not-a-cursor"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_task_cursor"
+
+
 def test_task_catalog_orders_uuid_ties_and_does_not_duplicate(tmp_path) -> None:
     app = create_app(tmp_path / "agentbus.sqlite3")
     with TestClient(app) as client:
@@ -83,3 +92,25 @@ def test_task_catalog_orders_uuid_ties_and_does_not_duplicate(tmp_path) -> None:
 
         assert seen == sorted((item["id"] for item in created), reverse=True)
         assert len(seen) == len(set(seen)) == 3
+
+
+def test_readonly_control_center_flow_uses_persisted_task_and_events(tmp_path) -> None:
+    app = create_app(tmp_path / "agentbus.sqlite3")
+    with TestClient(app) as client:
+        created = _create(client, title="control-center-heartbeat", assigned_to="dex")
+
+        catalog = client.get("/tasks")
+        assert catalog.status_code == 200
+        assert [item["id"] for item in catalog.json()["items"]] == [created["id"]]
+
+        detail = client.get(f"/tasks/{created['id']}")
+        assert detail.status_code == 200
+        assert detail.json() == created
+        assert detail.headers["etag"] == '"v1"'
+
+        trace = client.get(f"/correlations/{created['correlation_id']}/trace")
+        assert trace.status_code == 200
+        assert [task["id"] for task in trace.json()["tasks"]] == [created["id"]]
+        assert [(event["sequence"], event["type"]) for event in trace.json()["events"]] == [
+            (1, "task.created")
+        ]

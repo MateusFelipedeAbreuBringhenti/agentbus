@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from contextlib import closing
 import base64
+import binascii
 import hashlib
 import json
 import sqlite3
@@ -461,7 +462,15 @@ def _decode_task_cursor(cursor: str, fingerprint: str) -> tuple[str, str]:
             raise InvalidTaskCursor
         UUID(payload["id"])
         return payload["created_at"], payload["id"]
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError, KeyError):
+    except (
+        AttributeError,
+        binascii.Error,
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
         raise InvalidTaskCursor from None
 
 
