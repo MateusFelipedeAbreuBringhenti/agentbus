@@ -6,7 +6,7 @@ import re
 import sqlite3
 from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from agentbus.database import Database
@@ -24,6 +24,8 @@ from agentbus.models import (
     TaskCreate,
     TaskFail,
     TaskRead,
+    TaskPage,
+    TaskStatus,
     TaskRelease,
     SuccessorTaskCreate,
 )
@@ -37,6 +39,7 @@ from agentbus.service import (
     CausationCorrelationMismatch,
     CausationEventNotFound,
     IdempotencyConflict,
+    InvalidTaskCursor,
     PendingApprovalConflict,
     PredecessorCompletionEventInvalid,
     PredecessorNotSucceeded,
@@ -53,6 +56,7 @@ from agentbus.service import (
     get_approval,
     get_agent_inbox,
     get_task,
+    list_tasks,
     get_task_approvals,
     get_task_events,
     get_correlation_trace,
@@ -222,6 +226,18 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={"detail": {"code": "task_not_found", "message": "Task not found."}},
+        )
+
+    @app.exception_handler(InvalidTaskCursor)
+    async def invalid_task_cursor_handler(
+        _: Request, __: InvalidTaskCursor,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": {
+                "code": "invalid_task_cursor",
+                "message": "Task cursor is invalid or does not match the active filters.",
+            }},
         )
 
     @app.exception_handler(TaskStateConflict)
@@ -407,6 +423,27 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         if task is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
         return _task_response(task, status_code=status.HTTP_200_OK)
+
+    @app.get("/tasks", response_model=TaskPage)
+    def list_tasks_endpoint(
+        limit: int = Query(default=25, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1, max_length=1000),
+        task_status: TaskStatus | None = Query(default=None, alias="status"),
+        assigned_to: str | None = Query(default=None, min_length=1, max_length=200),
+        requested_by: str | None = Query(default=None, min_length=1, max_length=200),
+        correlation_id: UUID | None = None,
+        task_type: str | None = Query(default=None, alias="type", min_length=1, max_length=100),
+    ) -> TaskPage:
+        return list_tasks(
+            database,
+            limit=limit,
+            cursor=cursor,
+            status=task_status,
+            assigned_to=assigned_to,
+            requested_by=requested_by,
+            correlation_id=correlation_id,
+            task_type=task_type,
+        )
 
     @app.post(
         "/tasks/{task_id}/successors",
