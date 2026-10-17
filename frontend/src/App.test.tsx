@@ -46,6 +46,16 @@ describe("Control Center readonly", () => {
     expect(screen.queryByText("Nenhuma Task encontrada")).not.toBeInTheDocument();
   });
 
+  it("rejeita JSON válido que viola o contrato runtime", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => json({ items: "not-an-array" }));
+    render(<MemoryRouter initialEntries={["/tasks"]}><App /></MemoryRouter>);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "O AgentBus devolveu uma resposta inválida",
+    );
+    expect(screen.queryByText("Nenhuma Task encontrada")).not.toBeInTheDocument();
+  });
+
   it("navega de Task real para detalhe e trace causal", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
       const url = String(input);

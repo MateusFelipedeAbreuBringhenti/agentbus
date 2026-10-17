@@ -9,10 +9,13 @@ export function useLoad<T>(loader: (signal: AbortSignal) => Promise<T>, dependen
 
   useEffect(() => {
     const controller = new AbortController();
+    setData(null);
     setLoading(true);
     setError(null);
     loader(controller.signal)
-      .then((value) => setData(value))
+      .then((value) => {
+        if (!controller.signal.aborted) setData(value);
+      })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "Falha desconhecida.");
       })
