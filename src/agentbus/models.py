@@ -159,6 +159,11 @@ class CorrelationTrace(BaseModel):
     events: list[EventRead]
 
 
+class TaskPage(BaseModel):
+    items: list[TaskRead]
+    next_cursor: str | None
+
+
 class InboxTaskItem(BaseModel):
     kind: Literal["task"] = "task"
     attention_since: datetime

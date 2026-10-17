@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from contextlib import closing
+import base64
 import hashlib
 import json
 import sqlite3
@@ -26,6 +27,7 @@ from agentbus.models import (
     TaskCreate,
     TaskFail,
     TaskRead,
+    TaskPage,
     TaskRelease,
     TaskStatus,
 )
@@ -56,6 +58,10 @@ class CausationCorrelationMismatch(Exception):
 
 class TaskNotFound(Exception):
     """The target Task does not exist."""
+
+
+class InvalidTaskCursor(Exception):
+    """The Task catalog cursor is malformed or belongs to other filters."""
 
 
 class TaskStateConflict(Exception):
@@ -408,6 +414,55 @@ def _event_from_row(row: sqlite3.Row) -> EventRead:
         event_index=row["event_index"],
         occurred_at=row["occurred_at"],
     )
+
+
+def _task_filter_fingerprint(
+    *,
+    status: TaskStatus | None,
+    assigned_to: str | None,
+    requested_by: str | None,
+    correlation_id: UUID | None,
+    task_type: str | None,
+) -> str:
+    filters = json.dumps(
+        {
+            "assigned_to": assigned_to,
+            "correlation_id": str(correlation_id) if correlation_id else None,
+            "requested_by": requested_by,
+            "status": status.value if status else None,
+            "type": task_type,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(filters.encode("utf-8")).hexdigest()[:16]
+
+
+def _encode_task_cursor(created_at: str, task_id: str, fingerprint: str) -> str:
+    payload = json.dumps(
+        {"created_at": created_at, "filter": fingerprint, "id": task_id, "v": 1},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_task_cursor(cursor: str, fingerprint: str) -> tuple[str, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if (
+            payload.get("v") != 1
+            or payload.get("filter") != fingerprint
+            or not isinstance(payload.get("created_at"), str)
+            or not isinstance(payload.get("id"), str)
+        ):
+            raise InvalidTaskCursor
+        UUID(payload["id"])
+        return payload["created_at"], payload["id"]
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError, KeyError):
+        raise InvalidTaskCursor from None
 
 
 def create_task(
@@ -1247,6 +1302,62 @@ def get_task(database: Database, task_id: UUID) -> TaskRead | None:
             (str(task_id),),
         ).fetchone()
     return _task_from_row(row) if row is not None else None
+
+
+def list_tasks(
+    database: Database,
+    *,
+    limit: int,
+    cursor: str | None = None,
+    status: TaskStatus | None = None,
+    assigned_to: str | None = None,
+    requested_by: str | None = None,
+    correlation_id: UUID | None = None,
+    task_type: str | None = None,
+) -> TaskPage:
+    fingerprint = _task_filter_fingerprint(
+        status=status,
+        assigned_to=assigned_to,
+        requested_by=requested_by,
+        correlation_id=correlation_id,
+        task_type=task_type,
+    )
+    clauses: list[str] = []
+    parameters: list[object] = []
+    for column, value in (
+        ("status", status.value if status else None),
+        ("assigned_to", assigned_to),
+        ("requested_by", requested_by),
+        ("correlation_id", str(correlation_id) if correlation_id else None),
+        ("type", task_type),
+    ):
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            parameters.append(value)
+    if cursor is not None:
+        created_at, task_id = _decode_task_cursor(cursor, fingerprint)
+        clauses.append("(created_at < ? OR (created_at = ? AND id < ?))")
+        parameters.extend((created_at, created_at, task_id))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with closing(database.connect()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT * FROM tasks
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (*parameters, limit + 1),
+        ).fetchall()
+    page_rows = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page_rows:
+        last = page_rows[-1]
+        next_cursor = _encode_task_cursor(last["created_at"], last["id"], fingerprint)
+    return TaskPage(
+        items=[_task_from_row(row) for row in page_rows],
+        next_cursor=next_cursor,
+    )
 
 
 def get_task_events(database: Database, task_id: UUID) -> list[EventRead]:
