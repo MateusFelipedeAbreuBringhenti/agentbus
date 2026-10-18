@@ -134,6 +134,17 @@ class ApprovalRead(BaseModel):
     decided_at: datetime | None
 
 
+class ApprovalPage(BaseModel):
+    items: list[ApprovalRead]
+    next_cursor: str | None
+
+
+class AuthIdentityRead(BaseModel):
+    principal_id: str
+    subject_id: str
+    permissions: list[str]
+
+
 class RequestApprovalResult(BaseModel):
     task: TaskRead
     approval: ApprovalRead

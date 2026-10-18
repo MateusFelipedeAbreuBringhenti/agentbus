@@ -15,6 +15,7 @@ from agentbus.database import Database
 from agentbus.models import (
     AgentInbox,
     ApprovalDecision,
+    ApprovalPage,
     ApprovalRead,
     ApprovalStatus,
     EventRead,
@@ -64,6 +65,10 @@ class TaskNotFound(Exception):
 
 class InvalidTaskCursor(Exception):
     """The Task catalog cursor is malformed or belongs to other filters."""
+
+
+class InvalidApprovalCursor(Exception):
+    """The Approval catalog cursor is malformed or belongs to other filters."""
 
 
 class TaskStateConflict(Exception):
@@ -1476,6 +1481,66 @@ def get_approval(database: Database, approval_id: UUID) -> ApprovalRead | None:
             (str(approval_id),),
         ).fetchone()
     return _approval_from_row(row) if row is not None else None
+
+
+def list_approvals(
+    database: Database,
+    *,
+    limit: int,
+    cursor: str | None = None,
+    status: ApprovalStatus | None = None,
+    assigned_to: str | None = None,
+    task_id: UUID | None = None,
+    correlation_id: UUID | None = None,
+) -> ApprovalPage:
+    filters = {
+        "status": status.value if status else None,
+        "assigned_to": assigned_to,
+        "task_id": str(task_id) if task_id else None,
+        "correlation_id": str(correlation_id) if correlation_id else None,
+    }
+    fingerprint = hashlib.sha256(json.dumps(
+        filters, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    clauses: list[str] = []
+    parameters: list[object] = []
+    for column, value in filters.items():
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            parameters.append(value)
+    if cursor is not None:
+        try:
+            decoded = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+            if set(decoded) != {"created_at", "id", "fingerprint"}:
+                raise ValueError
+            if decoded["fingerprint"] != fingerprint:
+                raise ValueError
+            created_at, approval_id = decoded["created_at"], decoded["id"]
+            if not isinstance(created_at, str) or not isinstance(approval_id, str):
+                raise ValueError
+        except (ValueError, TypeError, json.JSONDecodeError, binascii.Error):
+            raise InvalidApprovalCursor from None
+        clauses.append("(created_at < ? OR (created_at = ? AND id < ?))")
+        parameters.extend((created_at, created_at, approval_id))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with closing(database.connect()) as connection:
+        rows = connection.execute(
+            f"SELECT * FROM approvals {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+            (*parameters, limit + 1),
+        ).fetchall()
+    page_rows = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page_rows:
+        last = page_rows[-1]
+        payload = json.dumps({
+            "created_at": last["created_at"], "id": last["id"],
+            "fingerprint": fingerprint,
+        }, sort_keys=True, separators=(",", ":")).encode()
+        next_cursor = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return ApprovalPage(
+        items=[_approval_from_row(row) for row in page_rows],
+        next_cursor=next_cursor,
+    )
 
 
 def get_task_approvals(database: Database, task_id: UUID) -> list[ApprovalRead]:

@@ -20,8 +20,10 @@ from agentbus.database import Database
 from agentbus.models import (
     AgentInbox,
     ApprovalDecision,
+    ApprovalPage,
     ApprovalRead,
     ApprovalStatus,
+    AuthIdentityRead,
     EventRead,
     CorrelationTrace,
     RequestApproval,
@@ -47,6 +49,7 @@ from agentbus.service import (
     CausationEventNotFound,
     IdempotencyConflict,
     InvalidTaskCursor,
+    InvalidApprovalCursor,
     PendingApprovalConflict,
     PredecessorCompletionEventInvalid,
     PredecessorNotSucceeded,
@@ -64,6 +67,7 @@ from agentbus.service import (
     get_agent_inbox,
     get_task,
     list_tasks,
+    list_approvals,
     get_task_approvals,
     get_task_events,
     get_correlation_trace,
@@ -301,6 +305,18 @@ def create_app(
             }},
         )
 
+    @app.exception_handler(InvalidApprovalCursor)
+    async def invalid_approval_cursor_handler(
+        _: Request, __: InvalidApprovalCursor,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": {
+                "code": "invalid_approval_cursor",
+                "message": "Approval cursor is invalid or does not match the active filters.",
+            }},
+        )
+
     @app.exception_handler(TaskStateConflict)
     async def task_state_conflict_handler(
         _: Request,
@@ -491,6 +507,16 @@ def create_app(
             if auth.subject_id != "*" and auth.subject_id != task.assigned_to:
                 raise ResourceAccessDenied
         return _task_response(task, status_code=status.HTTP_200_OK)
+
+    @app.get("/auth/me", response_model=AuthIdentityRead)
+    def authenticated_identity_endpoint(
+        auth: AuthContext = Depends(authenticated),
+    ) -> AuthIdentityRead:
+        return AuthIdentityRead(
+            principal_id=auth.principal_id,
+            subject_id=auth.subject_id,
+            permissions=sorted(auth.permissions),
+        )
 
     @app.get("/tasks", response_model=TaskPage)
     def list_tasks_endpoint(
@@ -722,6 +748,22 @@ def create_app(
             result.task,
             status_code=status.HTTP_200_OK,
             replayed=result.replayed,
+        )
+
+    @app.get("/approvals", response_model=ApprovalPage)
+    def list_approvals_endpoint(
+        limit: int = Query(default=25, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1, max_length=1000),
+        approval_status: ApprovalStatus | None = Query(default=None, alias="status"),
+        assigned_to: str | None = Query(default=None, min_length=1, max_length=200),
+        task_id: UUID | None = None,
+        correlation_id: UUID | None = None,
+        auth: AuthContext = Depends(authenticated),
+    ) -> ApprovalPage:
+        require(auth, "approval:read:any")
+        return list_approvals(
+            database, limit=limit, cursor=cursor, status=approval_status,
+            assigned_to=assigned_to, task_id=task_id, correlation_id=correlation_id,
         )
 
     @app.get("/approvals/{approval_id}", response_model=ApprovalRead)
