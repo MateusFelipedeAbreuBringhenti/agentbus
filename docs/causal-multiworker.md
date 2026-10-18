@@ -53,8 +53,8 @@ factual read model; the coordinator remains responsible for interpreting its own
 
 ## Security boundary
 
-The route enforces structural causal consistency, not authentication or authorization.
-AgentBus identities remain self-declared. Orion-ops removes identity, correlation, causation,
-and idempotency-key control from its MCP tool and injects its configured local principal, but
-an independent HTTP client is not thereby authenticated. Tasks must remain controlled and
-trusted under the LocalCodexExecutor limitation documented separately.
+The route enforces structural causal consistency in addition to the local principal policy.
+Orion-ops authenticates with its own bearer credential; its subject must match the durable
+outbox principal before recovery. Delegated `requested_by` remains attribution, not proof of
+human participation. Tasks must remain controlled and trusted under the LocalCodexExecutor
+limitation documented separately.
