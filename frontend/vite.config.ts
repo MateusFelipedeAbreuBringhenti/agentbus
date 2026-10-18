@@ -1,7 +1,10 @@
 import react from "@vitejs/plugin-react";
+import { loadEnv } from "vite";
 import { defineConfig } from "vitest/config";
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const environment = loadEnv(mode, ".", "");
+  return ({
   plugins: [react()],
   server: {
     host: "127.0.0.1",
@@ -9,9 +12,8 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8001",
+        target: environment.AGENTBUS_CONTROL_CENTER_GATEWAY ?? "http://127.0.0.1:8001",
         changeOrigin: false,
-        rewrite: (path) => path.replace(/^\/api/, ""),
       },
     },
   },
@@ -19,4 +21,5 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
   },
+  });
 });
