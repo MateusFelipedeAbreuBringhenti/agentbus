@@ -118,13 +118,17 @@ class ControlTransport(Protocol):
 
 
 class HttpControlTransport:
-    def __init__(self, base_url: str, *, timeout: float = 10.0) -> None:
+    def __init__(self, base_url: str, *, token: str, subject_id: str, timeout: float = 10.0) -> None:
         parsed = urlparse(base_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("AgentBus base URL must be loopback HTTP.")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("AgentBus base URL cannot contain credentials, query, or fragment.")
-        self._client = httpx.Client(base_url=base_url, timeout=timeout)
+        self.authenticated_subject_id = subject_id
+        self._client = httpx.Client(
+            base_url=base_url, timeout=timeout,
+            headers={"Authorization": f"Bearer {token}"},
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -166,6 +170,9 @@ class OrionOpsControlPlane:
     ) -> None:
         self._transport = transport
         self.principal = f"local-coordinator:{instance_id}"
+        authenticated_subject = getattr(transport, "authenticated_subject_id", self.principal)
+        if authenticated_subject != self.principal:
+            raise RuntimeError("AgentBus credential subject differs from Orion-ops principal.")
         self._outbox = outbox
 
     @property

@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 import pytest
 
 from agentbus import database as storage
-from agentbus.app import create_app
+from agentbus.app import create_test_app as create_app
+from agentbus.auth import TestAuthenticator
 from agentbus.database import Database
 from agentbus.models import TaskCreate
 from agentbus.service import create_task as create_task_record
@@ -340,7 +341,7 @@ def test_existing_v1_assigned_task_survives_upgrade_and_appears_in_inbox(
             assigned_to="dex",
             correlation_id=uuid4(),
         ),
-        "legacy-create",
+        "legacy-create", TestAuthenticator.context,
     ).task
     monkeypatch.setattr(storage, "MIGRATIONS", migrations)
 
@@ -354,4 +355,4 @@ def test_existing_v1_assigned_task_survives_upgrade_and_appears_in_inbox(
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,)]

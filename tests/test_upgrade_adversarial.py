@@ -11,10 +11,13 @@ from fastapi.testclient import TestClient
 import pytest
 
 from agentbus import database as storage
-from agentbus.app import create_app
+from agentbus.app import create_test_app as create_app
 from agentbus.database import Database
 from agentbus.models import TaskCreate, TaskClaim, TaskComplete, TaskFail
 from agentbus.service import create_task, claim_task, complete_task, fail_task
+from agentbus.auth import TestAuthenticator
+
+AUTH = TestAuthenticator.context
 
 
 @pytest.mark.parametrize('terminal', ['complete', 'fail'])
@@ -25,11 +28,11 @@ def test_v1_replays_survive_v2_upgrade(tmp_path, monkeypatch, terminal):
     monkeypatch.setattr(storage, 'MIGRATIONS', migrations[:1])
     db.migrate()
     task = create_task(db, TaskCreate(type='work', title='Legacy', requested_by='orion',
-                                    correlation_id=uuid4()), 'create').task
+                                    correlation_id=uuid4()), 'create', AUTH).task
     claim_body = TaskClaim(agent_id='dex')
-    claimed = claim_task(db, task.id, claim_body, 'claim').task
+    claimed = claim_task(db, task.id, claim_body, 'claim', AUTH).task
     body = TaskComplete(output={'done': True}) if terminal == 'complete' else TaskFail(failure_code='error', failure_message='Failed')
-    done = (complete_task if terminal == 'complete' else fail_task)(db, task.id, body, 'terminal', 2).task
+    done = (complete_task if terminal == 'complete' else fail_task)(db, task.id, body, 'terminal', 2, AUTH).task
     # Encode the actual Slice #002 persisted wire format, independent of current helper.
     with sqlite3.connect(path) as connection:
         for key, command, version in [('claim', claim_body, None), ('terminal', body, 2)]:
@@ -51,7 +54,7 @@ def test_v1_replays_survive_v2_upgrade(tmp_path, monkeypatch, terminal):
             assert response.headers['Idempotency-Replayed'] == 'true'
     with closing(sqlite3.connect(path)) as connection:
         assert connection.execute('SELECT count(*) FROM events').fetchone()[0] == 3
-        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,)]
+        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,)]
 
 
 def test_two_migrators_recheck_version_after_acquiring_write_lock(tmp_path, monkeypatch):
@@ -75,7 +78,7 @@ def test_two_migrators_recheck_version_after_acquiring_write_lock(tmp_path, monk
         for future in futures:
             future.result(timeout=10)
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,)]
+        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,)]
 
 
 def test_failed_v2_migration_rolls_back_schema_and_can_retry(tmp_path, monkeypatch):

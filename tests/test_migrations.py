@@ -33,7 +33,7 @@ def test_existing_version_one_database_receives_approval_migration(tmp_path):
         approvals_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'"
         ).fetchone()
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
     assert approvals_table == ("approvals",)
 
 
@@ -107,7 +107,7 @@ def test_v2_to_v3_preserves_tasks_and_backfills_unambiguous_wait(tmp_path, monke
         )
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
 
 
 def test_v2_to_v3_uses_only_open_pending_candidate_from_valid_history(

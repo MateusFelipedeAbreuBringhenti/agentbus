@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 
+from agentbus.auth import AuthContext
 from agentbus.database import Database
 from agentbus.models import (
     AgentInbox,
@@ -259,18 +260,34 @@ def _insert_task_event(
     event_type: str,
     data: dict,
     actor_id: str,
+    authenticated_principal_id: str,
     causation_event_id: UUID | None,
     command_id: UUID,
     occurred_at: str,
     event_index: int = 0,
 ) -> None:
+    if "authenticated_principal_id" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(events)")
+    }:
+        connection.execute(
+            """INSERT INTO events(
+                id, task_id, sequence, type, data_json, actor_id, correlation_id,
+                causation_event_id, command_id, event_index, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid4()), str(task.id), _next_event_sequence(connection, task.id),
+             event_type, json.dumps(data, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+             actor_id, str(task.correlation_id),
+             str(causation_event_id) if causation_event_id else None,
+             str(command_id), event_index, occurred_at),
+        )
+        return
     connection.execute(
         """
         INSERT INTO events(
             id, task_id, sequence, type, data_json, actor_id,
-            correlation_id, causation_event_id, command_id,
+            authenticated_principal_id, correlation_id, causation_event_id, command_id,
             event_index, occurred_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(uuid4()),
@@ -279,6 +296,7 @@ def _insert_task_event(
             event_type,
             json.dumps(data, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
             actor_id,
+            authenticated_principal_id,
             str(task.correlation_id),
             str(causation_event_id) if causation_event_id else None,
             str(command_id),
@@ -301,15 +319,29 @@ def _store_idempotency_response(
     resource_id: UUID,
     response_body: str,
     created_at: str,
+    authenticated_principal_id: str,
     response_status: int = 200,
 ) -> None:
+    if "authenticated_principal_id" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(idempotency_records)")
+    }:
+        connection.execute(
+            """INSERT INTO idempotency_records(
+                scope, key, request_hash, command_id, correlation_id, causation_event_id,
+                resource_type, resource_id, response_status, response_body, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (scope, idempotency_key, request_hash, str(command_id), str(correlation_id),
+             str(causation_event_id) if causation_event_id else None, resource_type,
+             str(resource_id), response_status, response_body, created_at),
+        )
+        return
     connection.execute(
         """
         INSERT INTO idempotency_records(
             scope, key, request_hash, command_id, correlation_id,
             causation_event_id, resource_type, resource_id,
-            response_status, response_body, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            response_status, response_body, created_at, authenticated_principal_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             scope,
@@ -323,6 +355,7 @@ def _store_idempotency_response(
             response_status,
             response_body,
             created_at,
+            authenticated_principal_id,
         ),
     )
 
@@ -337,6 +370,7 @@ def _store_command_idempotency(
     task: TaskRead,
     causation_event_id: UUID | None,
     created_at: str,
+    authenticated_principal_id: str,
 ) -> None:
     _store_idempotency_response(
         connection,
@@ -350,6 +384,7 @@ def _store_command_idempotency(
         resource_id=task.id,
         response_body=task.model_dump_json(),
         created_at=created_at,
+        authenticated_principal_id=authenticated_principal_id,
     )
 
 
@@ -409,6 +444,10 @@ def _event_from_row(row: sqlite3.Row) -> EventRead:
         type=row["type"],
         data=json.loads(row["data_json"]),
         actor_id=row["actor_id"],
+        authenticated_principal_id=(
+            row["authenticated_principal_id"]
+            if "authenticated_principal_id" in row.keys() else None
+        ),
         correlation_id=row["correlation_id"],
         causation_event_id=row["causation_event_id"],
         command_id=row["command_id"],
@@ -478,9 +517,11 @@ def create_task(
     database: Database,
     request: TaskCreate,
     idempotency_key: str,
+    auth: AuthContext,
 ) -> CreateTaskResult:
     request_hash = _canonical_request_hash(request)
-    idempotency_scope = _idempotency_scope(request.requested_by)
+    actor_id = request.requested_by if auth.subject_id == "*" else auth.subject_id
+    idempotency_scope = _idempotency_scope(actor_id)
 
     with database.transaction() as connection:
         existing = connection.execute(
@@ -546,25 +587,32 @@ def create_task(
             "type": request.type,
             "status": TaskStatus.READY.value,
         }
-        connection.execute(
-            """
-            INSERT INTO events(
-                id, task_id, sequence, type, data_json, actor_id,
-                correlation_id, causation_event_id, command_id,
-                event_index, occurred_at
-            ) VALUES (?, ?, 1, 'task.created', ?, ?, ?, ?, ?, 0, ?)
-            """,
-            (
-                str(event_id),
-                str(task_id),
-                json.dumps(event_data, separators=(",", ":"), sort_keys=True),
-                request.requested_by,
-                str(request.correlation_id),
-                str(request.causation_event_id) if request.causation_event_id else None,
-                str(command_id),
-                now_text,
-            ),
-        )
+        event_columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+        if "authenticated_principal_id" in event_columns:
+            connection.execute(
+                """INSERT INTO events(
+                    id, task_id, sequence, type, data_json, actor_id,
+                    authenticated_principal_id, correlation_id, causation_event_id,
+                    command_id, event_index, occurred_at
+                ) VALUES (?, ?, 1, 'task.created', ?, ?, ?, ?, ?, ?, 0, ?)""",
+                (str(event_id), str(task_id),
+                 json.dumps(event_data, separators=(",", ":"), sort_keys=True), actor_id,
+                 auth.principal_id, str(request.correlation_id),
+                 str(request.causation_event_id) if request.causation_event_id else None,
+                 str(command_id), now_text),
+            )
+        else:
+            connection.execute(
+                """INSERT INTO events(
+                    id, task_id, sequence, type, data_json, actor_id, correlation_id,
+                    causation_event_id, command_id, event_index, occurred_at
+                ) VALUES (?, ?, 1, 'task.created', ?, ?, ?, ?, ?, 0, ?)""",
+                (str(event_id), str(task_id),
+                 json.dumps(event_data, separators=(",", ":"), sort_keys=True), actor_id,
+                 str(request.correlation_id),
+                 str(request.causation_event_id) if request.causation_event_id else None,
+                 str(command_id), now_text),
+            )
 
         task = TaskRead(
             id=task_id,
@@ -587,25 +635,14 @@ def create_task(
             started_at=None,
             finished_at=None,
         )
-        connection.execute(
-            """
-            INSERT INTO idempotency_records(
-                scope, key, request_hash, command_id, correlation_id,
-                causation_event_id, resource_type, resource_id,
-                response_status, response_body, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'task', ?, 201, ?, ?)
-            """,
-            (
-                idempotency_scope,
-                idempotency_key,
-                request_hash,
-                str(command_id),
-                str(request.correlation_id),
-                str(request.causation_event_id) if request.causation_event_id else None,
-                str(task_id),
-                task.model_dump_json(),
-                now_text,
-            ),
+        _store_idempotency_response(
+            connection, scope=idempotency_scope, idempotency_key=idempotency_key,
+            request_hash=request_hash, command_id=command_id,
+            correlation_id=request.correlation_id,
+            causation_event_id=request.causation_event_id, resource_type="task",
+            resource_id=task_id, response_body=task.model_dump_json(),
+            created_at=now_text, response_status=201,
+            authenticated_principal_id=auth.principal_id,
         )
 
         return CreateTaskResult(task=task, replayed=False)
@@ -616,9 +653,11 @@ def create_successor_task(
     predecessor_id: UUID,
     request: SuccessorTaskCreate,
     idempotency_key: str,
+    auth: AuthContext,
 ) -> CreateTaskResult:
     request_hash = _command_request_hash(predecessor_id, request)
-    scope = _command_scope(request.requested_by, CREATE_SUCCESSOR_OPERATION)
+    actor_id = request.requested_by if auth.subject_id == "*" else auth.subject_id
+    scope = _command_scope(actor_id, CREATE_SUCCESSOR_OPERATION)
 
     with database.transaction() as connection:
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
@@ -682,7 +721,8 @@ def create_successor_task(
                 "task_id": str(task.id),
                 "type": task.type,
             },
-            actor_id=request.requested_by,
+            actor_id=actor_id,
+            authenticated_principal_id=auth.principal_id,
             causation_event_id=completion.id,
             command_id=command_id,
             occurred_at=now_text,
@@ -700,6 +740,7 @@ def create_successor_task(
             response_body=task.model_dump_json(),
             created_at=now_text,
             response_status=201,
+            authenticated_principal_id=auth.principal_id,
         )
         return CreateTaskResult(task=task, replayed=False)
 
@@ -709,8 +750,10 @@ def claim_task(
     task_id: UUID,
     request: TaskClaim,
     idempotency_key: str,
+    auth: AuthContext,
 ) -> TaskCommandResult:
-    scope = _command_scope(request.agent_id, CLAIM_TASK_OPERATION)
+    actor_id = request.agent_id if auth.subject_id == "*" else auth.subject_id
+    scope = _command_scope(actor_id, CLAIM_TASK_OPERATION)
     request_hash = _command_request_hash(task_id, request)
 
     with database.transaction() as connection:
@@ -779,7 +822,8 @@ def claim_task(
                 "task_id": str(task.id),
                 "version": task.version,
             },
-            actor_id=request.agent_id,
+            actor_id=actor_id,
+            authenticated_principal_id=auth.principal_id,
             causation_event_id=request.causation_event_id,
             command_id=command_id,
             occurred_at=now,
@@ -793,6 +837,7 @@ def claim_task(
             task=task,
             causation_event_id=request.causation_event_id,
             created_at=now,
+            authenticated_principal_id=auth.principal_id,
         )
         return TaskCommandResult(task=task, replayed=False)
 
@@ -809,6 +854,7 @@ def complete_task(
     request: TaskComplete,
     idempotency_key: str,
     expected_version: int,
+    auth: AuthContext,
 ) -> TaskCommandResult:
     request_hash = _command_request_hash(task_id, request, expected_version)
 
@@ -819,7 +865,8 @@ def complete_task(
         ).fetchone()
         if row is None:
             raise TaskNotFound
-        actor_id = _assigned_task_identity(row)
+        assigned_identity = _assigned_task_identity(row)
+        actor_id = assigned_identity if auth.subject_id == "*" else auth.subject_id
         scope = _command_scope(actor_id, COMPLETE_TASK_OPERATION)
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
         if replayed is not None:
@@ -865,6 +912,7 @@ def complete_task(
                 "version": task.version,
             },
             actor_id=actor_id,
+            authenticated_principal_id=auth.principal_id,
             causation_event_id=request.causation_event_id,
             command_id=command_id,
             occurred_at=now,
@@ -878,6 +926,7 @@ def complete_task(
             task=task,
             causation_event_id=request.causation_event_id,
             created_at=now,
+            authenticated_principal_id=auth.principal_id,
         )
         return TaskCommandResult(task=task, replayed=False)
 
@@ -888,6 +937,7 @@ def fail_task(
     request: TaskFail,
     idempotency_key: str,
     expected_version: int,
+    auth: AuthContext,
 ) -> TaskCommandResult:
     request_hash = _command_request_hash(task_id, request, expected_version)
 
@@ -898,7 +948,8 @@ def fail_task(
         ).fetchone()
         if row is None:
             raise TaskNotFound
-        actor_id = _assigned_task_identity(row)
+        assigned_identity = _assigned_task_identity(row)
+        actor_id = assigned_identity if auth.subject_id == "*" else auth.subject_id
         scope = _command_scope(actor_id, FAIL_TASK_OPERATION)
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
         if replayed is not None:
@@ -946,6 +997,7 @@ def fail_task(
                 "version": task.version,
             },
             actor_id=actor_id,
+            authenticated_principal_id=auth.principal_id,
             causation_event_id=request.causation_event_id,
             command_id=command_id,
             occurred_at=now,
@@ -959,6 +1011,7 @@ def fail_task(
             task=task,
             causation_event_id=request.causation_event_id,
             created_at=now,
+            authenticated_principal_id=auth.principal_id,
         )
         return TaskCommandResult(task=task, replayed=False)
 
@@ -969,8 +1022,10 @@ def request_task_approval(
     request: RequestApproval,
     idempotency_key: str,
     expected_version: int,
+    auth: AuthContext,
 ) -> RequestApprovalCommandResult:
-    scope = _command_scope(request.requested_by, REQUEST_APPROVAL_OPERATION)
+    actor_id = request.requested_by if auth.subject_id == "*" else auth.subject_id
+    scope = _command_scope(actor_id, REQUEST_APPROVAL_OPERATION)
     request_hash = _command_request_hash(task_id, request, expected_version)
 
     with database.transaction() as connection:
@@ -1060,7 +1115,8 @@ def request_task_approval(
                 "task_id": str(task.id),
                 "version": task.version,
             },
-            actor_id=request.requested_by,
+            actor_id=actor_id,
+            authenticated_principal_id=auth.principal_id,
             causation_event_id=request.causation_event_id,
             command_id=command_id,
             occurred_at=now,
@@ -1077,7 +1133,8 @@ def request_task_approval(
                 "task_id": str(task.id),
                 "version": approval.version,
             },
-            actor_id=request.requested_by,
+            actor_id=actor_id,
+            authenticated_principal_id=auth.principal_id,
             causation_event_id=request.causation_event_id,
             command_id=command_id,
             occurred_at=now,
@@ -1096,6 +1153,7 @@ def request_task_approval(
             resource_id=approval.id,
             response_body=result.model_dump_json(),
             created_at=now,
+            authenticated_principal_id=auth.principal_id,
         )
         return RequestApprovalCommandResult(result=result, replayed=False)
 
@@ -1107,13 +1165,15 @@ def decide_approval(
     idempotency_key: str,
     expected_version: int,
     decision: ApprovalStatus,
+    auth: AuthContext,
 ) -> ApprovalCommandResult:
     operation = (
         APPROVE_APPROVAL_OPERATION
         if decision is ApprovalStatus.APPROVED
         else REJECT_APPROVAL_OPERATION
     )
-    scope = _command_scope(request.decided_by, operation)
+    actor_id = request.decided_by if auth.subject_id == "*" else auth.subject_id
+    scope = _command_scope(actor_id, operation)
     request_hash = _command_request_hash(approval_id, request, expected_version)
 
     with database.transaction() as connection:
@@ -1190,7 +1250,8 @@ def decide_approval(
                 "task_id": str(task.id),
                 "version": approval.version,
             },
-            actor_id=request.decided_by,
+            actor_id=actor_id,
+            authenticated_principal_id=auth.principal_id,
             causation_event_id=request.causation_event_id,
             command_id=command_id,
             occurred_at=now,
@@ -1207,6 +1268,7 @@ def decide_approval(
             resource_id=approval.id,
             response_body=approval.model_dump_json(),
             created_at=now,
+            authenticated_principal_id=auth.principal_id,
         )
         return ApprovalCommandResult(approval=approval, replayed=False)
 
@@ -1217,8 +1279,10 @@ def release_task(
     request: TaskRelease,
     idempotency_key: str,
     expected_version: int,
+    auth: AuthContext,
 ) -> TaskCommandResult:
-    scope = _command_scope(request.actor_id, RELEASE_TASK_OPERATION)
+    actor_id = request.actor_id if auth.subject_id == "*" else auth.subject_id
+    scope = _command_scope(actor_id, RELEASE_TASK_OPERATION)
     request_hash = _command_request_hash(task_id, request, expected_version)
 
     with database.transaction() as connection:
@@ -1286,7 +1350,8 @@ def release_task(
                 "task_id": str(task.id),
                 "version": task.version,
             },
-            actor_id=request.actor_id,
+            actor_id=actor_id,
+            authenticated_principal_id=auth.principal_id,
             causation_event_id=request.causation_event_id,
             command_id=command_id,
             occurred_at=now,
@@ -1300,6 +1365,7 @@ def release_task(
             task=task,
             causation_event_id=request.causation_event_id,
             created_at=now,
+            authenticated_principal_id=auth.principal_id,
         )
         return TaskCommandResult(task=task, replayed=False)
 

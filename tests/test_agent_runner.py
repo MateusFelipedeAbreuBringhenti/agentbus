@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 import pytest
 
-from agentbus.app import create_app
+from agentbus.app import create_test_app as create_app
 from agentbus.coordinator import CoordinatorOutbox
 from agentbus.orion_ops import (
     ControlResponse,
@@ -18,6 +18,7 @@ from agentbus.orion_ops import (
 )
 from agentbus.runner import (
     AgentBusTransportError,
+    AgentBusAuthorizationError,
     AgentRunner,
     BusResponse,
     DeterministicWorkExecutor,
@@ -26,6 +27,13 @@ from agentbus.runner import (
     JournalLockedError,
     RunnerJournal,
 )
+
+
+class UnauthorizedBusClient:
+    authenticated_subject_id = "dex"
+
+    def get_inbox(self, agent_id):
+        return BusResponse(401, {"detail": {"code": "invalid_credential"}}, {})
 
 
 class TestAgentBusClient:
@@ -153,6 +161,17 @@ class LoseConfirmedResponseClient:
                 if_match,
             ),
         )
+
+
+def test_runner_stops_safely_when_credential_is_rejected(tmp_path):
+    with RunnerJournal(tmp_path / "unauthorized.sqlite3") as journal:
+        runner = AgentRunner(
+            agent_id="dex", client=UnauthorizedBusClient(), journal=journal,
+            executor=DeterministicWorkExecutor(),
+        )
+        with pytest.raises(AgentBusAuthorizationError):
+            runner.poll_once()
+        assert journal.pending() == []
 
 
 class SynchronizedInboxClient:

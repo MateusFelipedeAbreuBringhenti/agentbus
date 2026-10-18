@@ -62,7 +62,8 @@ describe("Control Center readonly", () => {
       if (url.includes("/correlations/")) {
         return json({ correlation_id: task.correlation_id, tasks: [task], events: [{
           id: "33333333-3333-4333-8333-333333333333", task_id: task.id, sequence: 1,
-          type: "task.created", data: {}, actor_id: "orion-ops", correlation_id: task.correlation_id,
+          type: "task.created", data: {}, actor_id: "orion-ops",
+          authenticated_principal_id: "coordinator-1", correlation_id: task.correlation_id,
           causation_event_id: null, command_id: "44444444-4444-4444-8444-444444444444",
           event_index: 0, occurred_at: task.created_at,
         }] });
