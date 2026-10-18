@@ -22,9 +22,12 @@ npm install
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. Vite listens only on loopback and proxies
-`/api/*` to `http://127.0.0.1:8000`, removing the `/api` prefix. No CORS
-configuration and no public endpoint are needed.
+Open `http://127.0.0.1:5173`. Vite listens only on loopback and preserves `/api`
+while proxying it to the enumerated gateway on `http://127.0.0.1:8001`; the
+gateway maps those routes to AgentBus on `http://127.0.0.1:8000`. It separately
+preserves `/intent-api` while proxying to the non-authoritative Approval intent
+service on `http://127.0.0.1:8002`. No CORS configuration or public endpoint is
+needed.
 
 ## Implemented surface
 
@@ -33,8 +36,10 @@ configuration and no public endpoint are needed.
 - causal trace projection containing persisted Tasks and append-only Events;
 - distinct loading, empty, malformed-response, HTTP-error and unavailable states.
 
-The remaining navigation entries are visibly deferred. They do not display
-mock operational data and do not invoke mutations.
+The Approval screen reads the real paginated catalog and can register a local
+intent. Registration is not an AgentBus mutation. A separate terminal confirmer
+with a human credential is required to decide an Approval. Other remaining
+navigation entries are visibly deferred and display no mock operational data.
 
 ## Task pagination contract
 
