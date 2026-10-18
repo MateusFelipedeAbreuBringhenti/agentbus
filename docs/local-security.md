@@ -11,6 +11,13 @@ atomic replacement with mode `0600`; raw tokens are never written to the reposit
 printed by `inspect`. Restart AgentBus and its client after a change. Rotation keeps the
 same logical subject so durable idempotent recovery remains valid.
 
+Issuance first records a mode-`0600` recovery journal beside the registry. If the process is
+interrupted between writing the client token and activating its registry entry, run
+`agentbus-auth recover --config /absolute/path/principals.json`. Recovery rewrites the same
+token, validates or creates the matching principal entry, and removes the journal only after
+both durable writes succeed. Other provisioning operations fail closed while recovery is
+pending.
+
 Each client sends its own bearer credential. Runner and Orion-ops read token files outside
 their SQLite journals. `actor_id` is the authenticated logical subject;
 `authenticated_principal_id` is the concrete credential. `requested_by` may be a delegated,

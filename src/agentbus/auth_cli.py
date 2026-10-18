@@ -58,6 +58,48 @@ def _write_validated(path: Path, payload: dict) -> None:
     _atomic_write(path, rendered)
 
 
+def _pending_path(config: Path) -> Path:
+    return config.with_suffix(config.suffix + ".pending")
+
+
+def _read_pending(config: Path) -> dict | None:
+    pending = _pending_path(config)
+    return json.loads(pending.read_text(encoding="utf-8")) if pending.exists() else None
+
+
+def _remove_pending(config: Path) -> None:
+    pending = _pending_path(config)
+    pending.unlink(missing_ok=True)
+    directory = os.open(pending.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _complete_pending(config: Path, pending: dict) -> None:
+    token_file = Path(pending["token_file"])
+    token = pending["token"]
+    entry = {
+        "principal_id": pending["principal_id"],
+        "subject_id": pending["subject_id"],
+        "token_sha256": token_digest(token),
+        "permissions": pending["permissions"],
+    }
+    _atomic_write(token_file, token + "\n")
+    payload = _read(config)
+    existing = next(
+        (item for item in payload["principals"] if item["principal_id"] == entry["principal_id"]),
+        None,
+    )
+    if existing is None:
+        payload["principals"].append(entry)
+        _write_validated(config, payload)
+    elif existing != entry:
+        raise ValueError("Pending issuance conflicts with the current principal registry.")
+    _remove_pending(config)
+
+
 def _issue(args: argparse.Namespace) -> None:
     config, token_file = Path(args.config), Path(args.token_file)
     if not config.is_absolute() or not token_file.is_absolute():
@@ -65,24 +107,45 @@ def _issue(args: argparse.Namespace) -> None:
     unknown = set(args.permission) - KNOWN_PERMISSIONS
     if unknown:
         raise ValueError(f"Unknown permissions: {sorted(unknown)}")
-    token = secrets.token_urlsafe(32)
     with _locked_config(config):
-        payload = _read(config)
-        if any(item["principal_id"] == args.principal for item in payload["principals"]):
-            raise ValueError("Principal id already exists.")
-        payload["principals"].append({
+        pending = _read_pending(config)
+        expected = {
             "principal_id": args.principal,
             "subject_id": args.subject,
-            "token_sha256": token_digest(token),
             "permissions": sorted(set(args.permission)),
-        })
-        _write_validated(config, payload)
-        _atomic_write(token_file, token + "\n")
+            "token_file": str(token_file),
+        }
+        if pending is not None:
+            if {key: pending[key] for key in expected} != expected:
+                raise ValueError("Another issuance is pending; run 'agentbus-auth recover'.")
+        else:
+            payload = _read(config)
+            if any(item["principal_id"] == args.principal for item in payload["principals"]):
+                raise ValueError("Principal id already exists.")
+            pending = {**expected, "token": secrets.token_urlsafe(32)}
+            _atomic_write(
+                _pending_path(config),
+                json.dumps(pending, indent=2, sort_keys=True) + "\n",
+            )
+        _complete_pending(config, pending)
+
+
+def _recover(args: argparse.Namespace) -> None:
+    config = Path(args.config)
+    if not config.is_absolute():
+        raise ValueError("Config path must be absolute.")
+    with _locked_config(config):
+        pending = _read_pending(config)
+        if pending is None:
+            raise ValueError("No interrupted issuance is pending.")
+        _complete_pending(config, pending)
 
 
 def _revoke(args: argparse.Namespace) -> None:
     config = Path(args.config)
     with _locked_config(config):
+        if _read_pending(config) is not None:
+            raise ValueError("An issuance is pending; run 'agentbus-auth recover' first.")
         payload = _read(config)
         kept = [p for p in payload["principals"] if p["principal_id"] != args.principal]
         if len(kept) == len(payload["principals"]):
@@ -113,6 +176,9 @@ def main() -> None:
     revoke.add_argument("--config", required=True)
     revoke.add_argument("--principal", required=True)
     revoke.set_defaults(handler=_revoke)
+    recover = commands.add_parser("recover")
+    recover.add_argument("--config", required=True)
+    recover.set_defaults(handler=_recover)
     inspect = commands.add_parser("inspect")
     inspect.add_argument("--config", required=True)
     inspect.set_defaults(handler=_inspect)
