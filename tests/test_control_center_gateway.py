@@ -32,6 +32,20 @@ def test_gateway_forwards_only_enumerated_get_with_read_token():
     assert arbitrary.status_code == 404
 
 
+def test_gateway_forwards_only_enumerated_approval_reads():
+    captured = []
+    approval_id = "11111111-1111-4111-8111-111111111111"
+    with TestClient(_gateway(captured), base_url="http://127.0.0.1:5173") as client:
+        catalog = client.get("/api/approvals?status=pending&assigned_to=mateus")
+        detail = client.get(f"/api/approvals/{approval_id}")
+        mutation = client.post(f"/api/approvals/{approval_id}/approve", json={})
+    assert catalog.status_code == detail.status_code == 200
+    assert captured[0].url.path == "/approvals"
+    assert captured[0].url.params["assigned_to"] == "mateus"
+    assert captured[1].url.path == f"/approvals/{approval_id}"
+    assert mutation.status_code == 404
+
+
 def test_gateway_rejects_host_origin_and_cross_site_requests():
     captured = []
     with TestClient(_gateway(captured), base_url="http://127.0.0.1:5173") as client:

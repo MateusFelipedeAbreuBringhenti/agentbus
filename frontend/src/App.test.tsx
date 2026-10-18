@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import type { Task } from "./types";
+import type { Approval } from "./types";
 
 const task: Task = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -80,5 +81,42 @@ describe("Control Center readonly", () => {
     expect(await screen.findByText("Eventos append-only (1)")).toBeInTheDocument();
     expect(screen.getByText("task.created")).toBeInTheDocument();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+  });
+});
+
+describe("Control Center human approval intent", () => {
+  it("registra intenção sem token humano e explica que não libera a Task", async () => {
+    const approval: Approval = {
+      id: "55555555-5555-4555-8555-555555555555", task_id: task.id,
+      gate: "deployment.production", status: "pending", request_reason: "Revisar deploy",
+      context: {}, requested_by: "orion", assigned_to: "mateus", decided_by: null,
+      decision_reason: null, correlation_id: task.correlation_id, version: 1,
+      created_at: task.created_at, updated_at: task.updated_at, decided_at: null,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === "/intent-api/session") return json({ csrf_token: "c".repeat(43), expires_at: task.updated_at });
+      if (url === "/intent-api/approval-intents") return json({
+        intent_id: "66666666-6666-4666-8666-666666666666",
+        approval: { id: approval.id, task_id: approval.task_id, gate: approval.gate,
+          status: approval.status, request_reason: approval.request_reason,
+          assigned_to: approval.assigned_to, version: approval.version },
+        decision: "approve", decision_reason: null, state: "pending",
+        created_at: task.created_at, confirmed_at: null, completed_at: null,
+        result: null, public_error: null, replayed: null,
+      }, 201);
+      expect(init?.headers).toBeUndefined();
+      return json({ items: [approval], next_cursor: null });
+    });
+    const user = userEvent.setup();
+    render(<MemoryRouter initialEntries={["/approvals"]}><App /></MemoryRouter>);
+    expect(await screen.findByText("Revisar deploy")).toBeInTheDocument();
+    expect(screen.getByText(/não libera nem executa automaticamente/)).toBeInTheDocument();
+    await user.click(screen.getByText("Solicitar aprovação"));
+    await user.click(screen.getByText("Registrar intenção"));
+    expect(await screen.findByText(/decisão ainda pendente/)).toBeInTheDocument();
+    const serializedCalls = JSON.stringify(fetchMock.mock.calls);
+    expect(serializedCalls).not.toContain("Authorization");
+    expect(serializedCalls).not.toContain("Bearer");
   });
 });
