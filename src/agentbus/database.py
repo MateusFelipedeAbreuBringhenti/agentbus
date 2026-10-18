@@ -9,6 +9,7 @@ MIGRATIONS = (
     (1, MIGRATIONS_DIRECTORY / "0001_initial.sql"),
     (2, MIGRATIONS_DIRECTORY / "0002_approvals.sql"),
     (3, MIGRATIONS_DIRECTORY / "0003_task_approval_wait_link.sql"),
+    (4, MIGRATIONS_DIRECTORY / "0004_authenticated_principals.sql"),
 )
 
 

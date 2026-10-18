@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 agentbus-orion-ops-mcp = "agentbus.orion_ops_mcp:main"
+agentbus-auth = "agentbus.auth_cli:main"
 
 [project.optional-dependencies]
 test = [

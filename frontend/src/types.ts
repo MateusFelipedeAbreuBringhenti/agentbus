@@ -35,6 +35,7 @@ export interface Event {
   type: string;
   data: Record<string, unknown>;
   actor_id: string;
+  authenticated_principal_id: string | null;
   correlation_id: string;
   causation_event_id: string | null;
   command_id: string;

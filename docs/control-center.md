@@ -13,7 +13,8 @@ AGENTBUS_DATABASE=/absolute/path/to/agentbus.sqlite3 \
   .venv/bin/uvicorn agentbus.app:app --app-dir src --host 127.0.0.1 --port 8000
 ```
 
-In another terminal, start the Vite development server:
+Start the enumerated read-only gateway on `127.0.0.1:8001` using the dedicated
+Control Center token described in `docs/local-security.md`. In another terminal, start Vite:
 
 ```bash
 cd frontend
@@ -60,9 +61,10 @@ the first page.
 ## Security boundary
 
 This is a controlled local interface, not a remote or multi-user console.
-AgentBus still has no general HTTP authentication. Keep both processes bound
-to loopback and do not expose the Vite or FastAPI ports through a tunnel or
-public reverse proxy.
+The browser has no AgentBus credential. Its same-origin `/api` calls go through the
+enumerated gateway, which injects a read-only principal and validates Host, Origin, and
+Fetch Metadata. This remains a controlled single-installation interface, not multi-user
+isolation. Keep every process on loopback and do not expose it through a tunnel.
 
 ## Verification
 

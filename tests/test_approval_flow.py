@@ -6,7 +6,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 import pytest
 
-from agentbus.app import create_app
+from agentbus.app import create_test_app as create_app
 
 
 @pytest.fixture

@@ -48,6 +48,7 @@ function isEvent(value: unknown): boolean {
     && typeof value.type === "string"
     && isRecord(value.data)
     && typeof value.actor_id === "string"
+    && isNullableString(value.authenticated_principal_id)
     && typeof value.correlation_id === "string"
     && isNullableString(value.causation_event_id)
     && typeof value.command_id === "string"

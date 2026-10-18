@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from agentbus.app import create_app
+from agentbus.app import create_test_app as create_app
 from test_approval_flow import (
     client, database_path, create_task, request_approval, decide, release,
 )
@@ -179,7 +179,7 @@ def test_sqlite_command_event_index_and_pending_index_boundaries(client, databas
         # Different sequence/id cannot bypass command/index uniqueness.
         with pytest.raises(sqlite3.IntegrityError, match='events.command_id, events.event_index'):
             db.execute("INSERT INTO events SELECT ?, task_id, 99, type, data_json, actor_id, "
-                       "correlation_id, causation_event_id, command_id, event_index, occurred_at "
+                       "correlation_id, causation_event_id, command_id, event_index, occurred_at, authenticated_principal_id "
                        "FROM events WHERE type='approval.requested'", (str(uuid4()),))
         # Same gate is allowed for terminal history and a different pending gate is allowed.
         for gate, state in [('deployment.production', 'rejected'), ('another.gate', 'pending')]:

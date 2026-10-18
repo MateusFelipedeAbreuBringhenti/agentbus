@@ -73,7 +73,11 @@ def test_real_orion_ops_to_local_codex_heartbeat(tmp_path):
     try:
         _wait_for_server(base_url, server)
         with (
-            HttpAgentBusClient(base_url) as bus,
+            HttpAgentBusClient(
+                base_url,
+                token=os.environ["AGENTBUS_DEX_TOKEN"],
+                subject_id="dex",
+            ) as bus,
             RunnerJournal(tmp_path / "runner.sqlite3") as journal,
             CodexSDKProvider() as provider,
             LocalCodexExecutionStore(tmp_path / "local-codex.sqlite3") as store,

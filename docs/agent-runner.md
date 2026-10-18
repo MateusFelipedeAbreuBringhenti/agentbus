@@ -20,6 +20,11 @@ O lock é implementado com `fcntl.flock`. Portanto, o Runner deste slice requer
 um ambiente POSIX compatível, como Linux, e não oferece suporte a Windows. Uma
 abstração de locking multiplataforma fica deliberadamente fora deste slice.
 
+O cliente HTTP requer uma credencial bearer exclusiva do worker e o subject lógico
+esperado. O token deve vir de arquivo `0600`, fora do journal e do repositório. O Runner
+falha se o subject autenticado divergir do `agent_id`; respostas `401`/`403` interrompem
+a recuperação sem gerar novas chaves ou serem tratadas como conflito de domínio.
+
 Uma linha de execução preserva somente fatos locais:
 
 - `claim_key` e `execution_id`, gravados antes do claim;

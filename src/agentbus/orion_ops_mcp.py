@@ -19,6 +19,7 @@ from .orion_ops import (
     ToolResult,
 )
 from .coordinator import CoordinatorOutbox
+from .auth import read_token_file
 
 
 CHARTER = """You are Orion-ops, a local operational coordinator, not hosted Orion.
@@ -106,7 +107,13 @@ def main() -> None:
     journal_path = Path(os.environ["AGENTBUS_ORION_OPS_JOURNAL"])
     if not journal_path.is_absolute():
         raise ValueError("AGENTBUS_ORION_OPS_JOURNAL must be an absolute durable path.")
-    transport = HttpControlTransport(os.environ.get("AGENTBUS_URL", "http://127.0.0.1:8000"))
+    principal = f"local-coordinator:{instance_id}"
+    token = read_token_file(os.environ["AGENTBUS_ORION_OPS_TOKEN_FILE"])
+    transport = HttpControlTransport(
+        os.environ.get("AGENTBUS_URL", "http://127.0.0.1:8000"),
+        token=token,
+        subject_id=principal,
+    )
     try:
         outbox = CoordinatorOutbox(journal_path)
         control = OrionOpsControlPlane(transport, instance_id=instance_id, outbox=outbox)

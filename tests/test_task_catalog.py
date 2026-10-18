@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from agentbus.app import create_app
+from agentbus.app import create_test_app as create_app
 
 
 def _create(client: TestClient, *, title: str, assigned_to: str | None = None) -> dict:

@@ -9,6 +9,7 @@ import sqlite3
 from threading import Event
 import time
 from typing import Any, Literal, Protocol
+from urllib.parse import urlparse
 from uuid import UUID, uuid4, uuid5
 
 import httpx
@@ -24,6 +25,10 @@ class JournalIdentityMismatch(Exception):
 
 class AgentBusTransportError(Exception):
     """The AgentBus response was unavailable or lost."""
+
+
+class AgentBusAuthorizationError(Exception):
+    """The configured runner principal is unauthenticated or unauthorized."""
 
 
 @dataclass(frozen=True)
@@ -64,8 +69,17 @@ class AgentBusClient(Protocol):
 
 
 class HttpAgentBusClient:
-    def __init__(self, base_url: str, *, timeout: float = 10.0) -> None:
-        self._client = httpx.Client(base_url=base_url, timeout=timeout)
+    def __init__(self, base_url: str, *, token: str, subject_id: str, timeout: float = 10.0) -> None:
+        parsed = urlparse(base_url)
+        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("AgentBus base URL must be loopback HTTP.")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("AgentBus base URL cannot contain credentials, query, or fragment.")
+        self.authenticated_subject_id = subject_id
+        self._client = httpx.Client(
+            base_url=base_url, timeout=timeout,
+            headers={"Authorization": f"Bearer {token}"},
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -421,6 +435,11 @@ class AgentRunner:
         journal: RunnerJournal,
         executor: WorkExecutor,
     ) -> None:
+        authenticated_subject = getattr(client, "authenticated_subject_id", agent_id)
+        if authenticated_subject != agent_id:
+            raise JournalIdentityMismatch(
+                "AgentBus credential subject differs from configured runner agent."
+            )
         self.agent_id = agent_id
         self.client = client
         self.journal = journal
@@ -446,6 +465,7 @@ class AgentRunner:
 
     def poll_once(self) -> None:
         inbox = self.client.get_inbox(self.agent_id)
+        self._require_authorized(inbox)
         if inbox.status_code != 200:
             return
         for item in inbox.body.get("items", []):
@@ -471,6 +491,7 @@ class AgentRunner:
                 )
             except AgentBusTransportError:
                 return
+            self._require_authorized(response)
             if response.status_code != 200:
                 detail = response.body.get("detail", {})
                 if response.status_code == 409 and detail.get("code") in {
@@ -491,6 +512,7 @@ class AgentRunner:
                 current = self.client.get_task(task_id)
             except AgentBusTransportError:
                 return
+            self._require_authorized(current)
             if current.status_code != 200:
                 return
             if (
@@ -535,5 +557,13 @@ class AgentRunner:
                 )
         except AgentBusTransportError:
             return
+        self._require_authorized(response)
         if response.status_code == 200:
             self.journal.mark_reported(task_id)
+
+    @staticmethod
+    def _require_authorized(response: BusResponse) -> None:
+        if response.status_code in {401, 403}:
+            raise AgentBusAuthorizationError(
+                "AgentBus rejected the configured runner principal."
+            )

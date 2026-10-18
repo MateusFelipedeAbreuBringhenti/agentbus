@@ -7,14 +7,18 @@ operations: `create_task`, `get_task`, `get_task_events`, `get_approval`,
 
 It deliberately has no generic HTTP, shell, SQL, filesystem, worker execution, or
 Approval-decision tool. Tool schemas do not accept a principal or `requested_by`.
-The bridge injects the fixed local identity and AgentBus uses it for authority,
-audit events, and idempotency scope:
+The bridge injects the fixed local identity. AgentBus authenticates the matching subject
+for authority and uses it for audit events and idempotency scope:
 
 ```ini
 principal = local-coordinator:<instance-id>
 actor_label = orion-ops
 persona_version = orion-ops/v1
 ```
+
+`AGENTBUS_ORION_OPS_TOKEN_FILE` points to an absolute mode-`0600` credential file.
+Its configured subject must exactly match the principal above. The token is never stored
+in the outbox or exposed through MCP; authentication failure during recovery aborts startup.
 
 The last two values describe the coordinator persona only. They grant no authority.
 

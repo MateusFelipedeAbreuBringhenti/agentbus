@@ -4,10 +4,17 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
+
+from agentbus.auth import (
+    AuthContext, Authenticator, AuthenticationRequired, EnvironmentAuthenticator,
+    InvalidCredential, PermissionDenied, PrincipalMismatch, ResourceAccessDenied,
+    TestAuthenticator,
+)
 
 from agentbus.database import Database
 from agentbus.models import (
@@ -139,17 +146,71 @@ def _expected_version(if_match: str | None) -> int:
     return int(matched.group(1))
 
 
-def create_app(database_path: str | Path | None = None) -> FastAPI:
+def create_app(
+    database_path: str | Path | None = None,
+    *,
+    authenticator: Authenticator | None = None,
+) -> FastAPI:
     path = database_path or os.environ.get("AGENTBUS_DATABASE", "agentbus.sqlite3")
     database = Database(path)
+    auth_backend = authenticator or EnvironmentAuthenticator()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if isinstance(auth_backend, EnvironmentAuthenticator):
+            auth_backend.load()
         database.migrate()
         yield
 
     app = FastAPI(title="AgentBus", version="0.1.0", lifespan=lifespan)
     app.state.database = database
+
+    def authenticated(
+        authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+    ) -> AuthContext:
+        return auth_backend.authenticate(authorization)
+
+    def require(auth: AuthContext, permission: str) -> None:
+        auth.require(permission)
+
+    def same_subject(auth: AuthContext, declared: str) -> None:
+        if auth.subject_id not in {"*", declared}:
+            raise PrincipalMismatch
+
+    def direct_or_delegated(auth: AuthContext, requested_by: str) -> None:
+        if auth.subject_id in {"*", requested_by}:
+            return
+        auth.require("task:create:delegated")
+
+    @app.exception_handler(AuthenticationRequired)
+    async def authentication_required_handler(_: Request, __: AuthenticationRequired) -> JSONResponse:
+        return JSONResponse(status_code=401, content={"detail": {
+            "code": "authentication_required", "message": "Bearer authentication is required."
+        }}, headers={"WWW-Authenticate": "Bearer"})
+
+    @app.exception_handler(InvalidCredential)
+    async def invalid_credential_handler(_: Request, __: InvalidCredential) -> JSONResponse:
+        return JSONResponse(status_code=401, content={"detail": {
+            "code": "invalid_credential", "message": "Bearer credential is invalid."
+        }}, headers={"WWW-Authenticate": "Bearer"})
+
+    @app.exception_handler(PermissionDenied)
+    async def permission_denied_handler(_: Request, __: PermissionDenied) -> JSONResponse:
+        return JSONResponse(status_code=403, content={"detail": {
+            "code": "permission_denied", "message": "Principal lacks the required permission."
+        }})
+
+    @app.exception_handler(PrincipalMismatch)
+    async def principal_mismatch_handler(_: Request, __: PrincipalMismatch) -> JSONResponse:
+        return JSONResponse(status_code=403, content={"detail": {
+            "code": "principal_mismatch", "message": "Declared identity differs from authenticated subject."
+        }})
+
+    @app.exception_handler(ResourceAccessDenied)
+    async def resource_access_denied_handler(_: Request, __: ResourceAccessDenied) -> JSONResponse:
+        return JSONResponse(status_code=403, content={"detail": {
+            "code": "resource_access_denied", "message": "Principal cannot access this resource."
+        }})
 
     @app.exception_handler(PredecessorNotSucceeded)
     async def predecessor_not_succeeded_handler(
@@ -409,8 +470,11 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             min_length=1,
             max_length=200,
         ),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
-        result = create_task(database, task, idempotency_key)
+        require(auth, "task:create")
+        direct_or_delegated(auth, task.requested_by)
+        result = create_task(database, task, idempotency_key, auth)
         return _task_response(
             result.task,
             status_code=status.HTTP_201_CREATED,
@@ -418,10 +482,14 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         )
 
     @app.get("/tasks/{task_id}", response_model=TaskRead)
-    def get_task_endpoint(task_id: UUID) -> JSONResponse:
+    def get_task_endpoint(task_id: UUID, auth: AuthContext = Depends(authenticated)) -> JSONResponse:
         task = get_task(database, task_id)
         if task is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+        if "task:read:any" not in auth.permissions:
+            require(auth, "task:read:self")
+            if auth.subject_id != "*" and auth.subject_id != task.assigned_to:
+                raise ResourceAccessDenied
         return _task_response(task, status_code=status.HTTP_200_OK)
 
     @app.get("/tasks", response_model=TaskPage)
@@ -433,7 +501,9 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         requested_by: str | None = Query(default=None, min_length=1, max_length=200),
         correlation_id: UUID | None = None,
         task_type: str | None = Query(default=None, alias="type", min_length=1, max_length=100),
+        auth: AuthContext = Depends(authenticated),
     ) -> TaskPage:
+        require(auth, "task:read:any")
         return list_tasks(
             database,
             limit=limit,
@@ -456,8 +526,11 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         idempotency_key: str = Header(
             alias="Idempotency-Key", min_length=1, max_length=200,
         ),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
-        result = create_successor_task(database, task_id, command, idempotency_key)
+        require(auth, "task:create:successor")
+        direct_or_delegated(auth, command.requested_by)
+        result = create_successor_task(database, task_id, command, idempotency_key, auth)
         return _task_response(
             result.task,
             status_code=status.HTTP_201_CREATED,
@@ -465,11 +538,14 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         )
 
     @app.get("/correlations/{correlation_id}/trace", response_model=CorrelationTrace)
-    def get_correlation_trace_endpoint(correlation_id: UUID) -> CorrelationTrace:
+    def get_correlation_trace_endpoint(correlation_id: UUID, auth: AuthContext = Depends(authenticated)) -> CorrelationTrace:
+        require(auth, "trace:read:any")
         return get_correlation_trace(database, correlation_id)
 
     @app.get("/agents/{agent_id}/inbox", response_model=AgentInbox)
-    def get_agent_inbox_endpoint(agent_id: str) -> AgentInbox:
+    def get_agent_inbox_endpoint(agent_id: str, auth: AuthContext = Depends(authenticated)) -> AgentInbox:
+        require(auth, "inbox:read:self")
+        same_subject(auth, agent_id)
         return get_agent_inbox(database, agent_id)
 
     @app.post("/tasks/{task_id}/claim", response_model=TaskRead)
@@ -481,8 +557,11 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             min_length=1,
             max_length=200,
         ),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
-        result = claim_task(database, task_id, command, idempotency_key)
+        require(auth, "task:claim:self")
+        same_subject(auth, command.agent_id)
+        result = claim_task(database, task_id, command, idempotency_key, auth)
         return _task_response(
             result.task,
             status_code=status.HTTP_200_OK,
@@ -499,13 +578,16 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             max_length=200,
         ),
         if_match: str | None = Header(default=None, alias="If-Match"),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
+        require(auth, "task:complete:self")
         result = complete_task(
             database,
             task_id,
             command,
             idempotency_key,
             _expected_version(if_match),
+            auth,
         )
         return _task_response(
             result.task,
@@ -523,13 +605,16 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             max_length=200,
         ),
         if_match: str | None = Header(default=None, alias="If-Match"),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
+        require(auth, "task:fail:self")
         result = fail_task(
             database,
             task_id,
             command,
             idempotency_key,
             _expected_version(if_match),
+            auth,
         )
         return _task_response(
             result.task,
@@ -547,13 +632,17 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             max_length=200,
         ),
         if_match: str | None = Header(default=None, alias="If-Match"),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
+        require(auth, "approval:request")
+        same_subject(auth, command.requested_by)
         result = request_task_approval(
             database,
             task_id,
             command,
             idempotency_key,
             _expected_version(if_match),
+            auth,
         )
         return _request_approval_response(result.result, result.replayed)
 
@@ -567,7 +656,10 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             max_length=200,
         ),
         if_match: str | None = Header(default=None, alias="If-Match"),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
+        require(auth, "approval:decide:self")
+        same_subject(auth, command.decided_by)
         result = decide_approval(
             database,
             approval_id,
@@ -575,6 +667,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             idempotency_key,
             _expected_version(if_match),
             ApprovalStatus.APPROVED,
+            auth,
         )
         return _approval_response(result.approval, replayed=result.replayed)
 
@@ -588,7 +681,10 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             max_length=200,
         ),
         if_match: str | None = Header(default=None, alias="If-Match"),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
+        require(auth, "approval:decide:self")
+        same_subject(auth, command.decided_by)
         result = decide_approval(
             database,
             approval_id,
@@ -596,6 +692,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             idempotency_key,
             _expected_version(if_match),
             ApprovalStatus.REJECTED,
+            auth,
         )
         return _approval_response(result.approval, replayed=result.replayed)
 
@@ -609,13 +706,17 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
             max_length=200,
         ),
         if_match: str | None = Header(default=None, alias="If-Match"),
+        auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
+        require(auth, "task:release")
+        same_subject(auth, command.actor_id)
         result = release_task(
             database,
             task_id,
             command,
             idempotency_key,
             _expected_version(if_match),
+            auth,
         )
         return _task_response(
             result.task,
@@ -624,27 +725,37 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
         )
 
     @app.get("/approvals/{approval_id}", response_model=ApprovalRead)
-    def get_approval_endpoint(approval_id: UUID) -> JSONResponse:
+    def get_approval_endpoint(approval_id: UUID, auth: AuthContext = Depends(authenticated)) -> JSONResponse:
         approval = get_approval(database, approval_id)
         if approval is None:
             raise ApprovalNotFound
+        if "approval:read:any" not in auth.permissions:
+            require(auth, "approval:read:self")
+            if auth.subject_id != "*" and auth.subject_id != approval.assigned_to:
+                raise ResourceAccessDenied
         return _approval_response(approval)
 
     @app.get("/tasks/{task_id}/approvals", response_model=list[ApprovalRead])
-    def get_task_approvals_endpoint(task_id: UUID) -> list[ApprovalRead]:
+    def get_task_approvals_endpoint(task_id: UUID, auth: AuthContext = Depends(authenticated)) -> list[ApprovalRead]:
+        require(auth, "approval:read:any")
         task = get_task(database, task_id)
         if task is None:
             raise TaskNotFound
         return get_task_approvals(database, task_id)
 
     @app.get("/tasks/{task_id}/events", response_model=list[EventRead])
-    def get_task_events_endpoint(task_id: UUID) -> list[EventRead]:
+    def get_task_events_endpoint(task_id: UUID, auth: AuthContext = Depends(authenticated)) -> list[EventRead]:
+        require(auth, "event:read:any")
         task = get_task(database, task_id)
         if task is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
         return get_task_events(database, task_id)
 
     return app
+
+
+def create_test_app(database_path: str | Path) -> FastAPI:
+    return create_app(database_path, authenticator=TestAuthenticator())
 
 
 app = create_app()

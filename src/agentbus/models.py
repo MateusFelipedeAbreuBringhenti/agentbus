@@ -146,6 +146,7 @@ class EventRead(BaseModel):
     type: str
     data: dict[str, Any]
     actor_id: str
+    authenticated_principal_id: str | None
     correlation_id: UUID
     causation_event_id: UUID | None
     command_id: UUID

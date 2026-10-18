@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 from fastapi.testclient import TestClient
 
-from agentbus.app import create_app
+from agentbus.app import create_test_app as create_app
 from agentbus.orion_ops import (
     CorrelationIdInput,
     CreateTaskInput,
@@ -417,11 +417,11 @@ def test_agentbus_domain_error_is_translated_without_losing_code():
 )
 def test_http_transport_rejects_non_loopback_or_decorated_urls(url):
     with pytest.raises(ValueError):
-        HttpControlTransport(url)
+        HttpControlTransport(url, token="x" * 32, subject_id="test")
 
 
 def test_http_transport_translates_non_json_response():
-    transport = HttpControlTransport("http://127.0.0.1:8000")
+    transport = HttpControlTransport("http://127.0.0.1:8000", token="x" * 32, subject_id="test")
     transport._client.close()
     transport._client = httpx.Client(
         base_url="http://127.0.0.1:8000",
