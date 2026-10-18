@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 
-from agentbus.auth import AuthContext
+from agentbus.auth import AuthContext, ResourceAccessDenied
 from agentbus.database import Database
 from agentbus.models import (
     AgentInbox,
@@ -867,6 +867,8 @@ def complete_task(
             raise TaskNotFound
         assigned_identity = _assigned_task_identity(row)
         actor_id = assigned_identity if auth.subject_id == "*" else auth.subject_id
+        if auth.subject_id != "*" and assigned_identity != auth.subject_id:
+            raise ResourceAccessDenied
         scope = _command_scope(actor_id, COMPLETE_TASK_OPERATION)
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
         if replayed is not None:
@@ -950,6 +952,8 @@ def fail_task(
             raise TaskNotFound
         assigned_identity = _assigned_task_identity(row)
         actor_id = assigned_identity if auth.subject_id == "*" else auth.subject_id
+        if auth.subject_id != "*" and assigned_identity != auth.subject_id:
+            raise ResourceAccessDenied
         scope = _command_scope(actor_id, FAIL_TASK_OPERATION)
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
         if replayed is not None:
@@ -1177,19 +1181,20 @@ def decide_approval(
     request_hash = _command_request_hash(approval_id, request, expected_version)
 
     with database.transaction() as connection:
-        replayed_body = _replayed_body(connection, scope, idempotency_key, request_hash)
-        if replayed_body is not None:
-            return ApprovalCommandResult(
-                approval=ApprovalRead.model_validate_json(replayed_body),
-                replayed=True,
-            )
-
         row = connection.execute(
             "SELECT * FROM approvals WHERE id = ?",
             (str(approval_id),),
         ).fetchone()
         if row is None:
             raise ApprovalNotFound
+        if auth.subject_id != "*" and row["assigned_to"] != auth.subject_id:
+            raise ResourceAccessDenied
+        replayed_body = _replayed_body(connection, scope, idempotency_key, request_hash)
+        if replayed_body is not None:
+            return ApprovalCommandResult(
+                approval=ApprovalRead.model_validate_json(replayed_body),
+                replayed=True,
+            )
         _validate_causation(connection, request.causation_event_id, row["correlation_id"])
         if row["status"] != ApprovalStatus.PENDING.value:
             raise ApprovalStateConflict(ApprovalStatus.PENDING, ApprovalStatus(row["status"]))

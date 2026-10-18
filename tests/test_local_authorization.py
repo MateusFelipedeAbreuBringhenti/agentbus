@@ -55,6 +55,8 @@ TOKENS = {
     "dex": "dex-token-000000000000000000000000000000",
     "mateus": "mateus-token-000000000000000000000000000",
     "viewer": "viewer-token-000000000000000000000000000",
+    "other": "other-token-0000000000000000000000000000",
+    "alice": "alice-token-0000000000000000000000000000",
 }
 
 
@@ -70,6 +72,13 @@ def _registry(tmp_path, *, second_orion=False, coordinator_subject="orion"):
             "task:complete:self", "task:fail:self",
         ]),
         ("human-mateus-1", "mateus", TOKENS["mateus"], [
+            "inbox:read:self", "approval:read:self", "approval:decide:self",
+        ]),
+        ("runner-other-1", "other", TOKENS["other"], [
+            "inbox:read:self", "task:read:self", "task:claim:self",
+            "task:complete:self", "task:fail:self",
+        ]),
+        ("human-alice-1", "alice", TOKENS["alice"], [
             "inbox:read:self", "approval:read:self", "approval:decide:self",
         ]),
         ("control-center-1", "control-center", TOKENS["viewer"], [
@@ -257,6 +266,69 @@ def test_only_assigned_human_can_decide_approval(tmp_path):
     assert coordinator.status_code == 403
     assert human.status_code == 200
     assert human.json()["decided_by"] == "mateus"
+
+
+def test_other_worker_cannot_replay_completed_task_result(tmp_path):
+    with TestClient(create_app(tmp_path / "db.sqlite3", authenticator=_registry(tmp_path))) as api:
+        task = api.post("/tasks", json=_payload(), headers=_headers(
+            "orion", **{"Idempotency-Key": "create"}
+        )).json()
+        claimed = api.post(f"/tasks/{task['id']}/claim", json={"agent_id": "dex"},
+                           headers=_headers("dex", **{"Idempotency-Key": "claim"})).json()
+        command = {"output": {"secret": "belongs-to-dex"}}
+        first = api.post(f"/tasks/{task['id']}/complete", json=command, headers=_headers(
+            "dex", **{"Idempotency-Key": "complete", "If-Match": f'"v{claimed["version"]}"'}
+        ))
+        stolen = api.post(f"/tasks/{task['id']}/complete", json=command, headers=_headers(
+            "other", **{"Idempotency-Key": "complete", "If-Match": f'"v{claimed["version"]}"'}
+        ))
+    assert first.status_code == 200
+    assert stolen.status_code == 403
+    assert stolen.json()["detail"]["code"] == "resource_access_denied"
+
+
+def test_other_worker_cannot_replay_failed_task_result(tmp_path):
+    with TestClient(create_app(tmp_path / "db.sqlite3", authenticator=_registry(tmp_path))) as api:
+        task = api.post("/tasks", json=_payload(), headers=_headers(
+            "orion", **{"Idempotency-Key": "create"}
+        )).json()
+        claimed = api.post(f"/tasks/{task['id']}/claim", json={"agent_id": "dex"},
+                           headers=_headers("dex", **{"Idempotency-Key": "claim"})).json()
+        command = {"failure_code": "controlled", "failure_message": "expected failure"}
+        headers = {"Idempotency-Key": "fail", "If-Match": f'"v{claimed["version"]}"'}
+        first = api.post(f"/tasks/{task['id']}/fail", json=command,
+                         headers=_headers("dex", **headers))
+        stolen = api.post(f"/tasks/{task['id']}/fail", json=command,
+                          headers=_headers("other", **headers))
+    assert first.status_code == 200
+    assert stolen.status_code == 403
+    assert stolen.json()["detail"]["code"] == "resource_access_denied"
+
+
+def test_other_human_cannot_replay_assigned_humans_decision(tmp_path):
+    with TestClient(create_app(tmp_path / "db.sqlite3", authenticator=_registry(tmp_path))) as api:
+        task = api.post("/tasks", json=_payload(), headers=_headers(
+            "orion", **{"Idempotency-Key": "create"}
+        )).json()
+        approval = api.post(f"/tasks/{task['id']}/request-approval", json={
+            "gate": "deployment.production", "request_reason": "Human decision",
+            "requested_by": "orion", "assigned_to": "mateus", "context": {},
+        }, headers=_headers(
+            "orion", **{"Idempotency-Key": "request", "If-Match": '"v1"'}
+        )).json()["approval"]
+        first = api.post(f"/approvals/{approval['id']}/approve", json={
+            "decided_by": "mateus"
+        }, headers=_headers(
+            "mateus", **{"Idempotency-Key": "decision", "If-Match": '"v1"'}
+        ))
+        stolen = api.post(f"/approvals/{approval['id']}/approve", json={
+            "decided_by": "alice"
+        }, headers=_headers(
+            "alice", **{"Idempotency-Key": "decision", "If-Match": '"v1"'}
+        ))
+    assert first.status_code == 200
+    assert stolen.status_code == 403
+    assert stolen.json()["detail"]["code"] == "resource_access_denied"
 
 
 def test_rotated_credential_for_same_subject_replays_without_rewriting_audit(tmp_path):

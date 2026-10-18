@@ -581,9 +581,6 @@ def create_app(
         auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
         require(auth, "task:complete:self")
-        task = get_task(database, task_id)
-        if task is not None and auth.subject_id not in {"*", task.assigned_to}:
-            raise ResourceAccessDenied
         result = complete_task(
             database,
             task_id,
@@ -611,9 +608,6 @@ def create_app(
         auth: AuthContext = Depends(authenticated),
     ) -> JSONResponse:
         require(auth, "task:fail:self")
-        task = get_task(database, task_id)
-        if task is not None and auth.subject_id not in {"*", task.assigned_to}:
-            raise ResourceAccessDenied
         result = fail_task(
             database,
             task_id,
@@ -666,9 +660,6 @@ def create_app(
     ) -> JSONResponse:
         require(auth, "approval:decide:self")
         same_subject(auth, command.decided_by)
-        approval = get_approval(database, approval_id)
-        if approval is not None and auth.subject_id not in {"*", approval.assigned_to}:
-            raise ResourceAccessDenied
         result = decide_approval(
             database,
             approval_id,
@@ -694,9 +685,6 @@ def create_app(
     ) -> JSONResponse:
         require(auth, "approval:decide:self")
         same_subject(auth, command.decided_by)
-        approval = get_approval(database, approval_id)
-        if approval is not None and auth.subject_id not in {"*", approval.assigned_to}:
-            raise ResourceAccessDenied
         result = decide_approval(
             database,
             approval_id,
