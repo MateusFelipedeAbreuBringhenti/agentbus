@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 from fastapi import FastAPI, Query, Request
@@ -19,6 +20,12 @@ def create_gateway(
     allowed_host: str = "127.0.0.1:5173",
     transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
+    parsed = urlparse(agentbus_url)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("AgentBus gateway target must be loopback HTTP.")
+    host_name = allowed_host.rsplit(":", 1)[0].strip("[]")
+    if host_name not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("Control Center Host must be loopback.")
     client = httpx.Client(
         base_url=agentbus_url,
         headers={"Authorization": f"Bearer {token}"},

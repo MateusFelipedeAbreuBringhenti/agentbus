@@ -25,6 +25,7 @@ from agentbus.runner import (
     ExecutionRequest,
     ExecutionSucceeded,
     JournalLockedError,
+    HttpAgentBusClient,
     RunnerJournal,
 )
 
@@ -172,6 +173,13 @@ def test_runner_stops_safely_when_credential_is_rejected(tmp_path):
         with pytest.raises(AgentBusAuthorizationError):
             runner.poll_once()
         assert journal.pending() == []
+
+
+def test_http_runner_client_rejects_non_loopback_agentbus():
+    with pytest.raises(ValueError, match="loopback HTTP"):
+        HttpAgentBusClient(
+            "https://example.com", token="x" * 32, subject_id="dex"
+        )
 
 
 class SynchronizedInboxClient:

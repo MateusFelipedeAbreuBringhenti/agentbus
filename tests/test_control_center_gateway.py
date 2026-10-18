@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 import httpx
 
 from agentbus.control_center_gateway import create_gateway
+import pytest
 
 
 def _gateway(captured):
@@ -41,3 +42,11 @@ def test_gateway_rejects_host_origin_and_cross_site_requests():
     assert bad_origin.status_code == 403
     assert cross_site.status_code == 403
     assert captured == []
+
+
+def test_gateway_rejects_non_loopback_target_and_host():
+    with pytest.raises(ValueError, match="target must be loopback"):
+        create_gateway(agentbus_url="https://example.com", token="r" * 32)
+    with pytest.raises(ValueError, match="Host must be loopback"):
+        create_gateway(agentbus_url="http://127.0.0.1:8000", token="r" * 32,
+                       allowed_host="example.com:5173")

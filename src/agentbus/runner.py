@@ -9,6 +9,7 @@ import sqlite3
 from threading import Event
 import time
 from typing import Any, Literal, Protocol
+from urllib.parse import urlparse
 from uuid import UUID, uuid4, uuid5
 
 import httpx
@@ -69,6 +70,11 @@ class AgentBusClient(Protocol):
 
 class HttpAgentBusClient:
     def __init__(self, base_url: str, *, token: str, subject_id: str, timeout: float = 10.0) -> None:
+        parsed = urlparse(base_url)
+        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("AgentBus base URL must be loopback HTTP.")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("AgentBus base URL cannot contain credentials, query, or fragment.")
         self.authenticated_subject_id = subject_id
         self._client = httpx.Client(
             base_url=base_url, timeout=timeout,
