@@ -16,6 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from agentbus.auth import read_token_file
 from agentbus.models import ApprovalRead, ApprovalStatus
@@ -25,6 +26,45 @@ COOKIE_NAME = "agentbus_intent_session"
 PENDING_TTL = timedelta(minutes=30)
 TERMINAL_RETENTION = timedelta(days=30)
 TERMINAL_STATES = {"completed", "stopped", "expired"}
+MAX_INTENT_BODY_BYTES = 16 * 1024
+
+
+class IntentBodyLimitMiddleware:
+    """Limit the actual streamed body, including chunked requests without a length."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == "/intent-api/approval-intents"
+        ):
+            await self.app(scope, receive, send)
+            return
+        received = 0
+        messages: list[Message] = []
+        while True:
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > MAX_INTENT_BODY_BYTES:
+                    await JSONResponse(
+                        {"detail": {"code": "intent_payload_too_large"}},
+                        status_code=413,
+                    )(scope, receive, send)
+                    return
+            messages.append(message)
+            if message["type"] != "http.request" or not message.get("more_body", False):
+                break
+
+        async def replay_receive() -> Message:
+            if messages:
+                return messages.pop(0)
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, replay_receive, send)
 
 
 class IntentCreate(BaseModel):
@@ -359,20 +399,30 @@ def create_intent_app(
         client.close()
 
     app = FastAPI(title="AgentBus Approval Intent Service", lifespan=lifespan)
+    app.add_middleware(IntentBodyLimitMiddleware)
 
     @app.middleware("http")
     async def boundary(request: Request, call_next):
         if request.headers.get("host") != allowed_host:
             return JSONResponse({"detail": {"code": "invalid_host"}}, status_code=400)
         origin = request.headers.get("origin")
-        if origin is not None and origin != f"http://{allowed_host}":
+        fetch_site = request.headers.get("sec-fetch-site")
+        creates_intent = (
+            request.method == "POST"
+            and request.url.path == "/intent-api/approval-intents"
+        )
+        if creates_intent and origin != f"http://{allowed_host}":
             return JSONResponse({"detail": {"code": "invalid_origin"}}, status_code=403)
-        if request.headers.get("sec-fetch-site") not in {None, "same-origin", "none"}:
+        if creates_intent and fetch_site != "same-origin":
+            return JSONResponse({"detail": {"code": "cross_site_request"}}, status_code=403)
+        if not creates_intent and origin is not None and origin != f"http://{allowed_host}":
+            return JSONResponse({"detail": {"code": "invalid_origin"}}, status_code=403)
+        if not creates_intent and fetch_site not in {None, "same-origin", "none"}:
             return JSONResponse({"detail": {"code": "cross_site_request"}}, status_code=403)
         length = request.headers.get("content-length")
         if length:
             try:
-                too_large = int(length) > 16 * 1024
+                too_large = int(length) > MAX_INTENT_BODY_BYTES
             except ValueError:
                 return JSONResponse({"detail": {"code": "invalid_content_length"}}, status_code=400)
             if too_large:

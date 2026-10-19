@@ -6,6 +6,10 @@ Approval intent payloads, protects them with Host, Origin, Fetch Metadata, a
 non-privileged SameSite session and CSRF token, and stores them in its own
 mode-`0600` SQLite journal.
 
+Creating an intent requires the exact configured browser `Origin` and
+`Sec-Fetch-Site: same-origin`. The 16 KiB request limit is enforced while the
+actual body is streamed, independently of `Content-Length`.
+
 Start the intent service on loopback:
 
 ```text

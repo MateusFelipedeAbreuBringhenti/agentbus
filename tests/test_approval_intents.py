@@ -85,6 +85,10 @@ def _intent_client(tmp_path, api, approval):
     client = TestClient(app, base_url="http://127.0.0.1:5173")
     client.__enter__()
     session = client.get("/intent-api/session").json()
+    client.headers.update({
+        "Origin": "http://127.0.0.1:5173",
+        "Sec-Fetch-Site": "same-origin",
+    })
     body = {
         "approval_id": approval["id"], "decision": "approve",
         "decision_reason": "Reviewed", "if_match": '"v1"',
@@ -171,6 +175,65 @@ def test_intent_http_boundary_rejects_cross_site_oversize_and_other_session(tmp_
                 other.get("/intent-api/session")
                 hidden = other.get(f"/intent-api/approval-intents/{intent['intent_id']}")
             assert hidden.status_code == 404
+        finally:
+            client.__exit__(None, None, None)
+
+
+def test_intent_creation_requires_exact_browser_origin_headers(tmp_path):
+    with TestClient(create_app(tmp_path / "bus.sqlite3", authenticator=_registry(tmp_path))) as api:
+        _, approval = _pending_approval(api)
+        _, journal, client, session, body = _intent_client(tmp_path, api, approval)
+        base_headers = {
+            "Intent-Key": "origin-check",
+            "X-AgentBus-CSRF": session["csrf_token"],
+        }
+        try:
+            client.headers.pop("Origin")
+            client.headers.pop("Sec-Fetch-Site")
+            for origin, fetch_site, expected_code in (
+                (None, "same-origin", "invalid_origin"),
+                ("http://127.0.0.1:5173", None, "cross_site_request"),
+                ("http://127.0.0.1:5173", "none", "cross_site_request"),
+                ("http://127.0.0.1:5173", "cross-site", "cross_site_request"),
+                ("https://attacker.example", "same-origin", "invalid_origin"),
+            ):
+                headers = dict(base_headers)
+                if origin is not None:
+                    headers["Origin"] = origin
+                if fetch_site is not None:
+                    headers["Sec-Fetch-Site"] = fetch_site
+                response = client.post(
+                    "/intent-api/approval-intents", json=body,
+                    headers=headers,
+                )
+                assert response.status_code == 403
+                assert response.json()["detail"]["code"] == expected_code
+            with journal.connect() as db:
+                assert db.execute("SELECT count(*) FROM approval_intents").fetchone()[0] == 0
+        finally:
+            client.__exit__(None, None, None)
+
+
+def test_intent_body_limit_counts_streamed_bytes_without_content_length(tmp_path):
+    with TestClient(create_app(tmp_path / "bus.sqlite3", authenticator=_registry(tmp_path))) as api:
+        _, approval = _pending_approval(api)
+        _, journal, client, session, body = _intent_client(tmp_path, api, approval)
+        payload = json.dumps({**body, "padding": "x" * 17_000}).encode()
+        try:
+            response = client.post(
+                "/intent-api/approval-intents",
+                content=(payload[index:index + 1024] for index in range(0, len(payload), 1024)),
+                headers={
+                    "Content-Type": "application/json",
+                    "Intent-Key": "chunked-oversized",
+                    "X-AgentBus-CSRF": session["csrf_token"],
+                },
+            )
+            assert "content-length" not in response.request.headers
+            assert response.status_code == 413, response.text
+            assert response.json()["detail"]["code"] == "intent_payload_too_large"
+            with journal.connect() as db:
+                assert db.execute("SELECT count(*) FROM approval_intents").fetchone()[0] == 0
         finally:
             client.__exit__(None, None, None)
 
