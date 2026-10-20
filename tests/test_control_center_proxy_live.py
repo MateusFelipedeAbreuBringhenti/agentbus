@@ -64,6 +64,11 @@ def test_browser_vite_gateway_agentbus_path_preserves_api_prefix(tmp_path):
     token_file = tmp_path / "viewer.token"
     token_file.write_text(viewer_token + "\n", encoding="utf-8")
     token_file.chmod(0o600)
+    execution_policy = tmp_path / "execution-policy.json"
+    execution_policy.write_text(json.dumps({
+        "policy_id": "proxy-live-v1", "subjects": {"dex": ["proxy-test"]},
+    }), encoding="utf-8")
+    execution_policy.chmod(0o600)
 
     base_env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
     bus = _start([
@@ -73,6 +78,7 @@ def test_browser_vite_gateway_agentbus_path_preserves_api_prefix(tmp_path):
         **base_env,
         "AGENTBUS_DATABASE": str(tmp_path / "agentbus.sqlite3"),
         "AGENTBUS_AUTH_CONFIG": str(registry),
+        "AGENTBUS_EXECUTION_POLICY": str(execution_policy),
     }, ROOT)
     gateway = intent_service = vite = None
     try:

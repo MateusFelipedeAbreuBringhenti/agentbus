@@ -28,15 +28,19 @@ class _AuthenticatedRunnerClient:
 
     def get_inbox(self, agent_id): return self._call("GET", f"/agents/{agent_id}/inbox")
     def get_task(self, task_id): return self._call("GET", f"/tasks/{task_id}")
-    def claim_task(self, task_id, agent_id, key):
-        return self._call("POST", f"/tasks/{task_id}/claim", json={"agent_id": agent_id},
+    def claim_task(self, task_id, agent_id, key, execution_id, runner_instance_id):
+        return self._call("POST", f"/tasks/{task_id}/claim", json={"agent_id": agent_id,
+                          "execution_id": execution_id, "runner_instance_id": runner_instance_id},
                           headers={"Idempotency-Key": key})
-    def complete_task(self, task_id, output, key, etag):
-        return self._call("POST", f"/tasks/{task_id}/complete", json={"output": output},
+    def complete_task(self, task_id, output, key, etag, execution_id, runner_instance_id):
+        return self._call("POST", f"/tasks/{task_id}/complete", json={"output": output,
+                          "execution_id": execution_id, "runner_instance_id": runner_instance_id},
                           headers={"Idempotency-Key": key, "If-Match": etag})
-    def fail_task(self, task_id, code, message, key, etag):
+    def fail_task(self, task_id, code, message, key, etag, execution_id, runner_instance_id):
         return self._call("POST", f"/tasks/{task_id}/fail",
-                          json={"failure_code": code, "failure_message": message},
+                          json={"failure_code": code, "failure_message": message,
+                                "execution_id": execution_id,
+                                "runner_instance_id": runner_instance_id},
                           headers={"Idempotency-Key": key, "If-Match": etag})
 
 
@@ -273,9 +277,13 @@ def test_other_worker_cannot_replay_completed_task_result(tmp_path):
         task = api.post("/tasks", json=_payload(), headers=_headers(
             "orion", **{"Idempotency-Key": "create"}
         )).json()
-        claimed = api.post(f"/tasks/{task['id']}/claim", json={"agent_id": "dex"},
+        execution_id, runner_instance_id = str(uuid4()), str(uuid4())
+        claimed = api.post(f"/tasks/{task['id']}/claim", json={"agent_id": "dex",
+                           "execution_id": execution_id,
+                           "runner_instance_id": runner_instance_id},
                            headers=_headers("dex", **{"Idempotency-Key": "claim"})).json()
-        command = {"output": {"secret": "belongs-to-dex"}}
+        command = {"output": {"secret": "belongs-to-dex"},
+                   "execution_id": execution_id, "runner_instance_id": runner_instance_id}
         first = api.post(f"/tasks/{task['id']}/complete", json=command, headers=_headers(
             "dex", **{"Idempotency-Key": "complete", "If-Match": f'"v{claimed["version"]}"'}
         ))
@@ -292,9 +300,13 @@ def test_other_worker_cannot_replay_failed_task_result(tmp_path):
         task = api.post("/tasks", json=_payload(), headers=_headers(
             "orion", **{"Idempotency-Key": "create"}
         )).json()
-        claimed = api.post(f"/tasks/{task['id']}/claim", json={"agent_id": "dex"},
+        execution_id, runner_instance_id = str(uuid4()), str(uuid4())
+        claimed = api.post(f"/tasks/{task['id']}/claim", json={"agent_id": "dex",
+                           "execution_id": execution_id,
+                           "runner_instance_id": runner_instance_id},
                            headers=_headers("dex", **{"Idempotency-Key": "claim"})).json()
-        command = {"failure_code": "controlled", "failure_message": "expected failure"}
+        command = {"failure_code": "controlled", "failure_message": "expected failure",
+                   "execution_id": execution_id, "runner_instance_id": runner_instance_id}
         headers = {"Idempotency-Key": "fail", "If-Match": f'"v{claimed["version"]}"'}
         first = api.post(f"/tasks/{task['id']}/fail", json=command,
                          headers=_headers("dex", **headers))
@@ -369,7 +381,8 @@ def test_authenticated_orion_ops_to_runner_heartbeat(tmp_path):
         with RunnerJournal(tmp_path / "runner.sqlite3") as journal:
             runner = AgentRunner(
                 agent_id="dex", client=_AuthenticatedRunnerClient(api), journal=journal,
-                executor=DeterministicWorkExecutor(),
+                    executor=DeterministicWorkExecutor(),
+                    allowed_task_types=frozenset({"heartbeat"}),
             )
             runner.poll_once()
         terminal = api.get(f"/tasks/{created.data['id']}", headers=_headers("viewer"))

@@ -57,22 +57,26 @@ class TestAgentBusClient:
     def get_task(self, task_id: str) -> BusResponse:
         return self._response(self.api.get(f"/tasks/{task_id}"))
 
-    def claim_task(self, task_id, agent_id, idempotency_key) -> BusResponse:
+    def claim_task(
+        self, task_id, agent_id, idempotency_key, execution_id, runner_instance_id
+    ) -> BusResponse:
         return self._response(
             self.api.post(
                 f"/tasks/{task_id}/claim",
-                json={"agent_id": agent_id},
+                json={"agent_id": agent_id, "execution_id": execution_id,
+                      "runner_instance_id": runner_instance_id},
                 headers={"Idempotency-Key": idempotency_key},
             )
         )
 
     def complete_task(
-        self, task_id, output, idempotency_key, if_match
+        self, task_id, output, idempotency_key, if_match, execution_id, runner_instance_id
     ) -> BusResponse:
         return self._response(
             self.api.post(
                 f"/tasks/{task_id}/complete",
-                json={"output": output},
+                json={"output": output, "execution_id": execution_id,
+                      "runner_instance_id": runner_instance_id},
                 headers={
                     "Idempotency-Key": idempotency_key,
                     "If-Match": if_match,
@@ -87,6 +91,8 @@ class TestAgentBusClient:
         failure_message,
         idempotency_key,
         if_match,
+        execution_id,
+        runner_instance_id,
     ) -> BusResponse:
         return self._response(
             self.api.post(
@@ -94,6 +100,8 @@ class TestAgentBusClient:
                 json={
                     "failure_code": failure_code,
                     "failure_message": failure_message,
+                    "execution_id": execution_id,
+                    "runner_instance_id": runner_instance_id,
                 },
                 headers={
                     "Idempotency-Key": idempotency_key,
@@ -135,22 +143,27 @@ class LoseConfirmedResponseClient:
     def get_task(self, task_id):
         return self.wrapped.get_task(task_id)
 
-    def claim_task(self, task_id, agent_id, idempotency_key):
+    def claim_task(self, task_id, agent_id, idempotency_key, execution_id, runner_instance_id):
         return self._lose_once(
             "claim",
-            lambda: self.wrapped.claim_task(task_id, agent_id, idempotency_key),
+            lambda: self.wrapped.claim_task(
+                task_id, agent_id, idempotency_key, execution_id, runner_instance_id
+            ),
         )
 
-    def complete_task(self, task_id, output, idempotency_key, if_match):
+    def complete_task(
+        self, task_id, output, idempotency_key, if_match, execution_id, runner_instance_id
+    ):
         return self._lose_once(
             "complete",
             lambda: self.wrapped.complete_task(
-                task_id, output, idempotency_key, if_match
+                task_id, output, idempotency_key, if_match, execution_id, runner_instance_id
             ),
         )
 
     def fail_task(
-        self, task_id, failure_code, failure_message, idempotency_key, if_match
+        self, task_id, failure_code, failure_message, idempotency_key, if_match,
+        execution_id, runner_instance_id
     ):
         return self._lose_once(
             "fail",
@@ -160,6 +173,8 @@ class LoseConfirmedResponseClient:
                 failure_message,
                 idempotency_key,
                 if_match,
+                execution_id,
+                runner_instance_id,
             ),
         )
 
@@ -168,7 +183,7 @@ def test_runner_stops_safely_when_credential_is_rejected(tmp_path):
     with RunnerJournal(tmp_path / "unauthorized.sqlite3") as journal:
         runner = AgentRunner(
             agent_id="dex", client=UnauthorizedBusClient(), journal=journal,
-            executor=DeterministicWorkExecutor(),
+            executor=DeterministicWorkExecutor(), allowed_task_types=frozenset({"runner_test"}),
         )
         with pytest.raises(AgentBusAuthorizationError):
             runner.poll_once()
@@ -289,6 +304,7 @@ def build_runner(api, journal, executor, *, client=None):
         client=client or TestAgentBusClient(api),
         journal=journal,
         executor=executor,
+        allowed_task_types=frozenset({"runner_test"}),
     )
 
 
@@ -380,7 +396,10 @@ def test_restart_before_executor_uses_confirmed_ownership(api, tmp_path):
     with RunnerJournal(path) as journal:
         identity = journal.runner_instance_id
         record = journal.prepare(task["id"])
-        claimed = client.claim_task(task["id"], "dex", record.claim_key)
+        claimed = client.claim_task(
+            task["id"], "dex", record.claim_key,
+            record.execution_id, record.runner_instance_id,
+        )
         journal.confirm_claim(task["id"], claimed.headers["etag"])
 
     executor = RecordingExecutor()
@@ -470,10 +489,14 @@ def test_current_task_must_match_claimed_version_before_executor(api, tmp_path):
     executor = RecordingExecutor()
     with RunnerJournal(tmp_path / "validate-current.sqlite3") as journal:
         record = journal.prepare(task["id"])
-        claim_response = client.claim_task(task["id"], "dex", record.claim_key)
+        claim_response = client.claim_task(
+            task["id"], "dex", record.claim_key,
+            record.execution_id, record.runner_instance_id,
+        )
         journal.confirm_claim(task["id"], claim_response.headers["etag"])
         completed = client.complete_task(
-            task["id"], {"external": True}, "external-complete", '"v2"'
+            task["id"], {"external": True}, "external-complete", '"v2"',
+            record.execution_id, record.runner_instance_id,
         )
         assert completed.status_code == 200
         build_runner(api, journal, executor).poll_once()
@@ -563,6 +586,7 @@ def test_two_worker_causal_heartbeat_recovers_lost_completion(api, tmp_path):
         producer = AgentRunner(
             agent_id="worker-a", client=lossy_client,
             journal=producer_journal, executor=ArtifactProducer(),
+            allowed_task_types=frozenset({"artifact-producer"}),
         )
         producer.poll_once()
         assert api.get(f"/tasks/{producer_task['id']}").json()["status"] == "succeeded"
@@ -583,6 +607,7 @@ def test_two_worker_causal_heartbeat_recovers_lost_completion(api, tmp_path):
         consumer = AgentRunner(
             agent_id="worker-b", client=base_client,
             journal=consumer_journal, executor=ArtifactConsumer(),
+            allowed_task_types=frozenset({"artifact-consumer"}),
         )
         consumer.poll_once()
 

@@ -32,6 +32,8 @@ Uma linha de execução preserva somente fatos locais:
 - `claim_rejected_at`, prova de que outra instância venceu;
 - resultado e `report_key`, gravados juntos antes de complete/fail;
 - `reported_at`, confirmação durável sem apagar o histórico.
+- `stopped_at`, `stop_code` e o status HTTP quando um conflito terminal impede
+  recuperação segura.
 
 Não existe enum de fase. O estado da Task continua vindo do AgentBus.
 
@@ -49,6 +51,11 @@ Não existe enum de fase. O estado da Task continua vindo do AgentBus.
 Antes de chamar o executor, o runner consulta a Task atual. Status ou ETag
 divergente interrompe a execução local; `assigned_to` isoladamente nunca prova
 ownership.
+
+O processo também exige uma allowlist local, explícita e não vazia, de tipos de
+Task. Apenas Tasks cujo `type` pertence a essa lista são preparadas ou entregues
+ao `WorkExecutor`. A allowlist local seleciona a implementação; a política central
+do AgentBus decide se o subject autenticado pode reivindicar aquele tipo.
 
 ## Executor
 
@@ -68,5 +75,7 @@ usa modelo ou fornecedor externo.
 
 O runner não decide Approvals, não adota Tasks órfãs, não implementa lease,
 heartbeat, scheduler, retry de Task, autenticação, push ou coordenação distribuída.
-Identidades permanecem autodeclaradas; impedir impersonação na API exige uma
-fronteira de autenticação futura.
+`runner_instance_id` é proveniência estrutural, não autenticação. Dois processos
+que compartilham a mesma credencial e conhecem os mesmos identificadores não são
+distinguíveis criptograficamente neste protocolo. O AgentBus também não comprova
+efeitos externos: eles continuam sob garantia `at-least-once` do executor.

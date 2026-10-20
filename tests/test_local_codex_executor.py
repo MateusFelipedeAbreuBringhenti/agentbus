@@ -100,26 +100,31 @@ class TestBusClient:
     def get_task(self, task_id):
         return self._response(self.api.get(f"/tasks/{task_id}"))
 
-    def claim_task(self, task_id, agent_id, idempotency_key):
+    def claim_task(self, task_id, agent_id, idempotency_key, execution_id, runner_instance_id):
         return self._response(
             self.api.post(
                 f"/tasks/{task_id}/claim",
-                json={"agent_id": agent_id},
+                json={"agent_id": agent_id, "execution_id": execution_id,
+                      "runner_instance_id": runner_instance_id},
                 headers={"Idempotency-Key": idempotency_key},
             )
         )
 
-    def complete_task(self, task_id, output, idempotency_key, if_match):
+    def complete_task(
+        self, task_id, output, idempotency_key, if_match, execution_id, runner_instance_id
+    ):
         return self._response(
             self.api.post(
                 f"/tasks/{task_id}/complete",
-                json={"output": output},
+                json={"output": output, "execution_id": execution_id,
+                      "runner_instance_id": runner_instance_id},
                 headers={"Idempotency-Key": idempotency_key, "If-Match": if_match},
             )
         )
 
     def fail_task(
-        self, task_id, failure_code, failure_message, idempotency_key, if_match
+        self, task_id, failure_code, failure_message, idempotency_key, if_match,
+        execution_id, runner_instance_id
     ):
         return self._response(
             self.api.post(
@@ -127,6 +132,8 @@ class TestBusClient:
                 json={
                     "failure_code": failure_code,
                     "failure_message": failure_message,
+                    "execution_id": execution_id,
+                    "runner_instance_id": runner_instance_id,
                 },
                 headers={"Idempotency-Key": idempotency_key, "If-Match": if_match},
             )
@@ -337,6 +344,7 @@ def test_full_heartbeat_and_approval_is_structurally_ignored(tmp_path):
                 client=TestBusClient(api),
                 journal=journal,
                 executor=executor,
+                    allowed_task_types=frozenset({"local_codex_test"}),
             )
             runner.poll_once()
 
@@ -371,6 +379,7 @@ def test_real_local_codex_full_heartbeat(tmp_path):
                         client=TestBusClient(api),
                         journal=journal,
                         executor=executor,
+                        allowed_task_types=frozenset({"local_codex_test"}),
                     ).poll_once()
 
         terminal = api.get(f"/tasks/{task['id']}").json()

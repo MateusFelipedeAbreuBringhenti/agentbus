@@ -87,7 +87,10 @@ def test_real_orion_ops_to_local_codex_heartbeat(tmp_path):
                 store=store,
                 workspace_root=tmp_path / "workspaces",
             )
-            runner = AgentRunner(agent_id="dex", client=bus, journal=journal, executor=executor)
+            runner = AgentRunner(
+                agent_id="dex", client=bus, journal=journal, executor=executor,
+                allowed_task_types=frozenset({"combine"}),
+            )
             instance = uuid4()
             correlation = uuid4()
             bridge = str(

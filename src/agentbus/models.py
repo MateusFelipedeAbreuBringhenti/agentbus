@@ -49,6 +49,8 @@ class TaskClaim(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_id: str = Field(min_length=1, max_length=200)
+    execution_id: UUID | None = None
+    runner_instance_id: UUID | None = None
     causation_event_id: UUID | None = None
 
 
@@ -56,6 +58,8 @@ class TaskComplete(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     output: dict[str, Any]
+    execution_id: UUID | None = None
+    runner_instance_id: UUID | None = None
     causation_event_id: UUID | None = None
 
 
@@ -64,6 +68,8 @@ class TaskFail(BaseModel):
 
     failure_code: str = Field(min_length=1, max_length=100)
     failure_message: str = Field(min_length=1, max_length=10_000)
+    execution_id: UUID | None = None
+    runner_instance_id: UUID | None = None
     causation_event_id: UUID | None = None
 
 
@@ -114,6 +120,12 @@ class TaskRead(BaseModel):
     updated_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    execution_id: UUID | None = None
+    runner_instance_id: UUID | None = None
+    execution_subject_id: str | None = None
+    claimed_principal_id: str | None = None
+    claim_policy_id: str | None = None
+    claim_policy_sha256: str | None = None
 
 
 class ApprovalRead(BaseModel):
