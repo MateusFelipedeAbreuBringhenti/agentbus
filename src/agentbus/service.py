@@ -126,6 +126,14 @@ class ApprovalNotCurrentForTask(Exception):
     """The Approval did not open the Task's current wait."""
 
 
+class ApprovalRequestProvenanceInvalid(Exception):
+    """The Approval has no unique authenticated request Event."""
+
+
+class ApprovalDecisionCausationInvalid(Exception):
+    """Release does not cite the unique matching authenticated approval Event."""
+
+
 class PendingApprovalConflict(Exception):
     """A pending Approval already exists for this Task and gate."""
 
@@ -1296,18 +1304,12 @@ def release_task(
     request_hash = _command_request_hash(task_id, request, expected_version)
 
     with database.transaction() as connection:
-        replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
-        if replayed is not None:
-            return TaskCommandResult(task=replayed, replayed=True)
-
         row = connection.execute(
             "SELECT * FROM tasks WHERE id = ?",
             (str(task_id),),
         ).fetchone()
         if row is None:
             raise TaskNotFound
-        _validate_causation(connection, request.causation_event_id, row["correlation_id"])
-
         approval_row = connection.execute(
             "SELECT * FROM approvals WHERE id = ?",
             (str(request.approval_id),),
@@ -1318,6 +1320,36 @@ def release_task(
             raise ApprovalTaskMismatch
         if approval_row["correlation_id"] != row["correlation_id"]:
             raise ApprovalCorrelationMismatch
+        if auth.subject_id != "*" and approval_row["requested_by"] != auth.subject_id:
+            raise ResourceAccessDenied
+
+        request_events = connection.execute(
+            """SELECT * FROM events
+            WHERE task_id = ? AND type = 'approval.requested'
+            ORDER BY sequence""",
+            (str(task_id),),
+        ).fetchall()
+        matching_requests = []
+        for event in request_events:
+            try:
+                data = json.loads(event["data_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                data.get("approval_id") == str(request.approval_id)
+                and data.get("task_id") == str(task_id)
+                and event["correlation_id"] == row["correlation_id"]
+                and event["actor_id"] == approval_row["requested_by"]
+                and event["authenticated_principal_id"] is not None
+            ):
+                matching_requests.append(event)
+        if len(matching_requests) != 1:
+            raise ApprovalRequestProvenanceInvalid
+
+        replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
+        if replayed is not None:
+            return TaskCommandResult(task=replayed, replayed=True)
+
         if row["waiting_on_approval_id"] != str(request.approval_id):
             raise ApprovalNotCurrentForTask
         if approval_row["status"] != ApprovalStatus.APPROVED.value:
@@ -1325,6 +1357,28 @@ def release_task(
                 ApprovalStatus.APPROVED,
                 ApprovalStatus(approval_row["status"]),
             )
+        if request.causation_event_id is None:
+            raise ApprovalDecisionCausationInvalid
+        decision_event = connection.execute(
+            "SELECT * FROM events WHERE id = ?",
+            (str(request.causation_event_id),),
+        ).fetchone()
+        if decision_event is None:
+            raise ApprovalDecisionCausationInvalid
+        try:
+            decision_data = json.loads(decision_event["data_json"])
+        except (TypeError, json.JSONDecodeError):
+            raise ApprovalDecisionCausationInvalid from None
+        if not (
+            decision_event["type"] == "approval.approved"
+            and decision_event["task_id"] == str(task_id)
+            and decision_event["correlation_id"] == row["correlation_id"]
+            and decision_event["authenticated_principal_id"] is not None
+            and decision_data.get("approval_id") == str(request.approval_id)
+            and decision_data.get("task_id") == str(task_id)
+            and decision_data.get("status") == ApprovalStatus.APPROVED.value
+        ):
+            raise ApprovalDecisionCausationInvalid
         if row["status"] != TaskStatus.WAITING_APPROVAL.value:
             raise TaskStateConflict(
                 TaskStatus.WAITING_APPROVAL,

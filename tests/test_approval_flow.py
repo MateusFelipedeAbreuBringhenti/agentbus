@@ -87,6 +87,12 @@ def release(
     key: str = "release-001",
     cause: str | None = None,
 ):
+    if cause is None:
+        cause = next((
+            event["id"] for event in client.get(f"/tasks/{task_id}/events").json()
+            if event["type"] == "approval.approved"
+            and event["data"].get("approval_id") == approval_id
+        ), None)
     body = {"approval_id": approval_id, "actor_id": "orion"}
     if cause is not None:
         body["causation_event_id"] = cause
@@ -335,8 +341,9 @@ def test_release_idempotency_hash_includes_specific_approval_id(client):
     collision = release(
         client,
         task["id"],
-        str(uuid4()),
+        approval["id"],
         key="release-id-collision",
+        cause=str(uuid4()),
     )
 
     assert first.status_code == 200
@@ -413,7 +420,14 @@ def test_release_requires_matching_if_match(client):
     task = create_task(client)
     approval = request_approval(client, task["id"]).json()["approval"]
     decide(client, approval["id"], "approve", key="approve-before-version-tests")
-    body = {"approval_id": approval["id"], "actor_id": "orion"}
+    approval_event = next(
+        event for event in client.get(f"/tasks/{task['id']}/events").json()
+        if event["type"] == "approval.approved"
+    )
+    body = {
+        "approval_id": approval["id"], "actor_id": "orion",
+        "causation_event_id": approval_event["id"],
+    }
     endpoint = f"/tasks/{task['id']}/release"
 
     missing = client.post(

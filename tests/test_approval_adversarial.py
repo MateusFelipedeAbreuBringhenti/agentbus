@@ -162,13 +162,14 @@ def test_causal_validation_for_every_decision_and_reaction(client, database_path
     before = snapshot(database_path)
     response = (release(client, task['id'], approval['id'], cause=cause) if operation == 'release'
                 else decide(client, approval['id'], operation, key='causal', cause=cause))
-    if cause_kind == 'same-correlation':
+    if cause_kind == 'same-correlation' and operation != 'release':
         assert response.status_code == 200
         with closing(sqlite3.connect(database_path)) as db:
             assert db.execute('SELECT causation_event_id FROM events WHERE task_id=? ORDER BY sequence DESC',
                               (task['id'],)).fetchone()[0] == cause
     else:
-        assert response.status_code == (422 if cause_kind == 'missing' else 409)
+        expected_status = 409 if operation == 'release' else (422 if cause_kind == 'missing' else 409)
+        assert response.status_code == expected_status
         assert snapshot(database_path) == before
 
 
@@ -293,9 +294,17 @@ def test_old_approval_cannot_release_new_wait(client):
     assert blocked['waiting_on_approval_id'] == new.json()['approval']['id']
     assert new.json()['approval']['status'] == 'pending'
     decide(client, new.json()['approval']['id'], 'approve', key='approve-new')
+    approval_event = next(
+        event for event in client.get(f"/tasks/{task['id']}/events").json()
+        if event['type'] == 'approval.approved'
+        and event['data'].get('approval_id') == new.json()['approval']['id']
+    )
     released = client.post(
         f"/tasks/{task['id']}/release",
-        json={'approval_id': new.json()['approval']['id'], 'actor_id': 'orion'},
+        json={
+            'approval_id': new.json()['approval']['id'], 'actor_id': 'orion',
+            'causation_event_id': approval_event['id'],
+        },
         headers={'Idempotency-Key': 'release-new', 'If-Match': '"v4"'},
     )
     assert released.status_code == 200
