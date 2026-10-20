@@ -1,4 +1,4 @@
-import type { Approval, ApprovalIntent, ApprovalPage, CorrelationTrace, Task, TaskPage, TaskStatus } from "./types";
+import type { Approval, ApprovalIntent, ApprovalPage, CorrelationTrace, OperationalItem, OperationalPage, OperationKind, Task, TaskPage, TaskStatus } from "./types";
 
 export class AgentBusUnavailable extends Error {}
 
@@ -101,6 +101,28 @@ function isApprovalIntent(value: unknown): value is ApprovalIntent {
     && (typeof value.replayed === "boolean" || value.replayed === null);
 }
 
+function isOperationalItem(value: unknown): value is OperationalItem {
+  return isRecord(value) && typeof value.operation_id === "string" && typeof value.source_id === "string"
+    && ["approval_intent", "release", "runner", "outbox"].includes(String(value.kind))
+    && typeof value.persisted_state === "string" && typeof value.attention_class === "string"
+    && typeof value.recovery_mode === "string" && isNullableString(value.task_id)
+    && isNullableString(value.approval_id) && isNullableString(value.correlation_id)
+    && typeof value.logical_owner === "string" && isNullableString(value.created_at)
+    && isNullableString(value.state_observed_at) && ["exact", "lower_bound", "unknown"].includes(String(value.timestamp_quality))
+    && (value.last_http_status === null || Number.isInteger(value.last_http_status))
+    && isNullableString(value.public_error_code) && Array.isArray(value.evidence)
+    && value.evidence.every((entry) => typeof entry === "string") && typeof value.summary === "string";
+}
+
+function isOperationalPage(value: unknown): value is OperationalPage {
+  return isRecord(value) && Array.isArray(value.items) && value.items.every(isOperationalItem)
+    && isNullableString(value.next_cursor) && value.snapshot_scope === "per_request_not_global"
+    && Array.isArray(value.sources) && value.sources.every((source) => isRecord(source)
+      && typeof source.source_id === "string" && ["approval_intent", "release", "runner", "outbox"].includes(String(source.kind))
+      && ["available", "unavailable", "incompatible"].includes(String(source.status))
+      && typeof source.observed_at === "string" && isNullableString(source.public_error_code));
+}
+
 async function readJson<T>(
   path: string,
   decoder: Decoder<T>,
@@ -171,6 +193,18 @@ export function listApprovals(filters: ApprovalFilters, signal?: AbortSignal): P
   if (filters.status) params.set("status", filters.status);
   if (filters.cursor) params.set("cursor", filters.cursor);
   return readJson(`/approvals?${params}`, isApprovalPage, signal);
+}
+
+export interface OperationFilters { kind?: OperationKind; attentionClass?: string; cursor?: string; limit?: number; }
+export function listOperations(filters: OperationFilters, signal?: AbortSignal): Promise<OperationalPage> {
+  const params = new URLSearchParams({ limit: String(filters.limit ?? 20) });
+  if (filters.kind) params.set("kind", filters.kind);
+  if (filters.attentionClass) params.set("attention_class", filters.attentionClass);
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  return readJson(`/operations?${params}`, isOperationalPage, signal);
+}
+export function getOperation(id: string, signal?: AbortSignal): Promise<OperationalItem> {
+  return readJson(`/operations/${encodeURIComponent(id)}`, isOperationalItem, signal);
 }
 
 let csrfToken: string | null = null;

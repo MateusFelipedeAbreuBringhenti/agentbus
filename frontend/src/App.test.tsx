@@ -142,3 +142,28 @@ describe("Control Center human approval intent", () => {
     expect(screen.queryByText("Solicitar aprovação")).not.toBeInTheDocument();
   });
 });
+
+describe("Operational visibility", () => {
+  it("mostra fontes indisponíveis e estado ambíguo sem oferecer recuperação", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => json({
+      items: [{ operation_id: "op-safe", source_id: "release-main", kind: "release",
+        persisted_state: "sending", attention_class: "active_or_ambiguous",
+        recovery_mode: "exact_command_replay", task_id: task.id, approval_id: null,
+        correlation_id: task.correlation_id, logical_owner: "orion-ops",
+        created_at: task.created_at, state_observed_at: task.updated_at,
+        timestamp_quality: "exact", last_http_status: null,
+        public_error_code: "transport_error", evidence: ["journal.task_id"],
+        summary: "Release ativo ou resposta ainda não confirmada." }],
+      next_cursor: null, snapshot_scope: "per_request_not_global",
+      sources: [{ source_id: "release-main", kind: "release", status: "available",
+        observed_at: task.updated_at, public_error_code: null },
+        { source_id: "runner-dex", kind: "runner", status: "unavailable",
+          observed_at: task.updated_at, public_error_code: "source_unavailable" }],
+    }));
+    render(<MemoryRouter initialEntries={["/operations"]}><App /></MemoryRouter>);
+    expect(await screen.findByText("sending")).toBeInTheDocument();
+    expect(screen.getByText("runner-dex: unavailable")).toBeInTheDocument();
+    expect(screen.getByText(/Idade não representa diagnóstico/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /recuper/i })).not.toBeInTheDocument();
+  });
+});
