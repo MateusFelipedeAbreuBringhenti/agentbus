@@ -60,7 +60,7 @@ def test_manifest_is_closed_private_and_allowlisted(tmp_path):
 def test_catalog_is_authenticated_redacted_and_cursor_bound_to_filters(tmp_path):
     journal = tmp_path / "intent.sqlite3"; _approval_journal(journal)
     with sqlite3.connect(journal) as db:
-        db.execute("UPDATE approval_intents SET last_error_code='private/internal/error' WHERE intent_id='intent-0'")
+        db.execute("UPDATE approval_intents SET last_error_code='private/internal/error' WHERE intent_id='intent-1'")
     before = hashlib.sha256(journal.read_bytes()).hexdigest()
     agentbus, app = _app(tmp_path, [{"source_id": "intents", "kind": "approval_intent", "path": str(journal), "logical_owner": "human"}])
     with TestClient(app) as client:
