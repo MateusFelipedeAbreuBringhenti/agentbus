@@ -240,3 +240,44 @@ def test_replaced_allowlisted_path_is_unavailable_and_symlink_is_not_followed(tm
         assert body["sources"][0]["status"] == "unavailable"
         assert "unexpected-target" not in json.dumps(body)
     agentbus.close()
+
+
+def test_wal_committed_row_is_visible_without_checkpoint_or_mutation(tmp_path):
+    journal = tmp_path / "wal.sqlite3"
+    writer = sqlite3.connect(journal, isolation_level=None)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("""CREATE TABLE approval_intents(
+        intent_id TEXT, approval_id TEXT, task_id TEXT, correlation_id TEXT,
+        state TEXT, created_at TEXT, confirmed_at TEXT, sending_at TEXT,
+        completed_at TEXT, intended_subject_id TEXT, last_http_status INTEGER,
+        last_error_code TEXT, command_body_json TEXT, command_sha256 TEXT)""")
+    writer.execute("INSERT INTO approval_intents VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        "intent-wal", "approval-wal", "task-wal", "corr-wal", "pending",
+        "2026-10-20T00:00:00+00:00", None, None, None, "mateus", None, None,
+        '{"secret":"must-not-leak"}', "command-hash",
+    ))
+    assert Path(f"{journal}-wal").exists()
+    for path in (journal, Path(f"{journal}-wal"), Path(f"{journal}-shm")):
+        path.chmod(0o400)
+    before = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (journal, Path(f"{journal}-wal"), Path(f"{journal}-shm"))
+    }
+    agentbus, app = _app(tmp_path, [{
+        "source_id": "wal", "kind": "approval_intent", "path": str(journal),
+        "logical_owner": "human",
+    }])
+    with TestClient(app) as client:
+        body = client.get("/operations", headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert body["sources"][0]["status"] == "available"
+        assert len(body["items"]) == 1
+        assert body["items"][0]["persisted_state"] == "pending"
+        assert body["items"][0]["task_id"] == "task-wal"
+    after = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (journal, Path(f"{journal}-wal"), Path(f"{journal}-shm"))
+    }
+    assert after == before
+    agentbus.close()
+    writer.close()

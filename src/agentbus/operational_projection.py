@@ -9,8 +9,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import stat
+import tempfile
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
@@ -196,17 +198,45 @@ class OperationalProjection:
         except OSError:
             raise SourceUnavailable from None
         db = None
+        temporary = None
         try:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != expected:
                 raise SourceUnavailable
-            uri = f"file:{quote(f'/proc/self/fd/{descriptor}', safe='/')}?mode=ro"
+            database_path = f"/proc/self/fd/{descriptor}"
+            wal_path = f"{source.path}-wal"
+            if os.path.exists(wal_path):
+                wal_descriptor = None
+                try:
+                    wal_descriptor = os.open(wal_path, flags)
+                    wal_before = os.fstat(wal_descriptor)
+                    database_before = os.fstat(descriptor)
+                    if not stat.S_ISREG(wal_before.st_mode):
+                        raise SourceUnavailable
+                    temporary = tempfile.TemporaryDirectory(prefix="agentbus-projection-")
+                    database_path = str(Path(temporary.name) / "journal.sqlite3")
+                    with os.fdopen(os.dup(descriptor), "rb") as source_file, open(database_path, "wb") as target:
+                        shutil.copyfileobj(source_file, target)
+                    with os.fdopen(os.dup(wal_descriptor), "rb") as source_file, open(f"{database_path}-wal", "wb") as target:
+                        shutil.copyfileobj(source_file, target)
+                    database_after = os.fstat(descriptor)
+                    wal_after = os.fstat(wal_descriptor)
+                    signature = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+                    if signature(database_before) != signature(database_after) or signature(wal_before) != signature(wal_after):
+                        raise SourceUnavailable
+                except OSError:
+                    raise SourceUnavailable from None
+                finally:
+                    if wal_descriptor is not None:
+                        os.close(wal_descriptor)
+            uri = f"file:{quote(database_path, safe='/')}?mode=ro"
             db = sqlite3.connect(uri, uri=True, timeout=1, isolation_level=None)
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA query_only=ON")
             yield db
         finally:
             if db is not None: db.close()
+            if temporary is not None: temporary.cleanup()
             os.close(descriptor)
 
     def _rows(self, source: SourceConfig) -> list[sqlite3.Row]:

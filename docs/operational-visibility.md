@@ -13,6 +13,14 @@ as unavailable and is not adopted until restart with a validated manifest.
 This implementation therefore targets Linux, like the existing `flock`-based
 Runner and release controls.
 
+When a live `-wal` file is present, the service copies the database and WAL
+through protected descriptors into a private ephemeral snapshot. It verifies
+that their identity, size, and modification time remained stable during the
+copy, then opens only the snapshot in `mode=ro`. This lets SQLite consume
+committed WAL frames without writing lock coordination into the source `-shm`.
+If either source changes during capture, that read reports the source as
+unavailable instead of presenting a potentially inconsistent snapshot.
+
 ## Manifest
 
 The manifest must be an absolute mode-`0600` JSON file. Every source id and
