@@ -34,6 +34,8 @@ needed.
 - paginated Task catalog with status, assignee and type filters;
 - Task details including version/ETag, correlation, timestamps and failures;
 - causal trace projection containing persisted Tasks and append-only Events;
+- operational visibility across statically allowlisted local journals, with
+  explicit partial-source failures and no recovery controls;
 - distinct loading, empty, malformed-response, HTTP-error and unavailable states.
 
 The Approval screen reads the real paginated catalog and can register a local
