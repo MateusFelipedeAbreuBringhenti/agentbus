@@ -27,6 +27,13 @@ export function TaskDetail() {
         <div><dt>Correlação</dt><dd><Link to={`/correlations/${task.correlation_id}`}>{task.correlation_id}</Link></dd></div>
         <div><dt>Aprovação atual</dt><dd>{task.waiting_on_approval_id ?? "—"}</dd></div>
       </dl></article>
+      <article className="panel"><h2>Proveniência da execução</h2><dl>
+        <div><dt>Execução</dt><dd className="mono">{task.execution_id ?? "Sem evidência histórica"}</dd></div>
+        <div><dt>Instância declarada</dt><dd className="mono">{task.runner_instance_id ?? "—"}</dd></div>
+        <div><dt>Subject autenticado</dt><dd>{task.execution_subject_id ?? "—"}</dd></div>
+        <div><dt>Principal do claim</dt><dd>{task.claimed_principal_id ?? "—"}</dd></div>
+        <div><dt>Política no claim</dt><dd>{task.claim_policy_id ?? "—"}</dd></div>
+      </dl><p className="muted">A instância é proveniência declarada; não é uma identidade criptográfica.</p></article>
       <article className="panel"><h2>Linha do tempo</h2><dl>
         <div><dt>Criada</dt><dd>{new Date(task.created_at).toLocaleString("pt-BR")}</dd></div><div><dt>Atualizada</dt><dd>{new Date(task.updated_at).toLocaleString("pt-BR")}</dd></div>
         <div><dt>Iniciada</dt><dd>{task.started_at ? new Date(task.started_at).toLocaleString("pt-BR") : "—"}</dd></div><div><dt>Finalizada</dt><dd>{task.finished_at ? new Date(task.finished_at).toLocaleString("pt-BR") : "—"}</dd></div>

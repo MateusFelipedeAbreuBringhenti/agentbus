@@ -26,6 +26,12 @@ export interface Task {
   updated_at: string;
   started_at: string | null;
   finished_at: string | null;
+  execution_id: string | null;
+  runner_instance_id: string | null;
+  execution_subject_id: string | null;
+  claimed_principal_id: string | null;
+  claim_policy_id: string | null;
+  claim_policy_sha256: string | null;
 }
 
 export interface Event {

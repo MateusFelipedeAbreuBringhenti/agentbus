@@ -26,6 +26,12 @@ const task: Task = {
   updated_at: "2026-10-17T12:02:00Z",
   started_at: "2026-10-17T12:01:00Z",
   finished_at: "2026-10-17T12:02:00Z",
+  execution_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  runner_instance_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  execution_subject_id: "dex",
+  claimed_principal_id: "runner-dex-1",
+  claim_policy_id: "execution-v1",
+  claim_policy_sha256: "a".repeat(64),
 };
 
 function json(value: unknown, status = 200) {
