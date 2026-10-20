@@ -38,7 +38,10 @@ needed.
 
 The Approval screen reads the real paginated catalog and can register a local
 intent. Registration is not an AgentBus mutation. A separate terminal confirmer
-with a human credential is required to decide an Approval. Other remaining
+with a human credential is required to decide an Approval. Approved records can
+also display the factual Task state: still waiting on that Approval, released
+and ready, or another persisted state. The panel never performs release and does
+not infer workflow completion. Other remaining
 navigation entries are visibly deferred and display no mock operational data.
 
 ## Task pagination contract

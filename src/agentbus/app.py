@@ -42,6 +42,8 @@ from agentbus.service import (
     ApprovalCorrelationMismatch,
     ApprovalNotFound,
     ApprovalNotCurrentForTask,
+    ApprovalRequestProvenanceInvalid,
+    ApprovalDecisionCausationInvalid,
     ApprovalStateConflict,
     ApprovalTaskMismatch,
     ApprovalVersionConflict,
@@ -437,6 +439,30 @@ def create_app(
                     "message": "Approval did not open the Task's current wait.",
                 }
             },
+        )
+
+    @app.exception_handler(ApprovalRequestProvenanceInvalid)
+    async def approval_request_provenance_invalid_handler(
+        _: Request, __: ApprovalRequestProvenanceInvalid,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": {
+                "code": "approval_request_provenance_invalid",
+                "message": "Approval has no unique authenticated request provenance.",
+            }},
+        )
+
+    @app.exception_handler(ApprovalDecisionCausationInvalid)
+    async def approval_decision_causation_invalid_handler(
+        _: Request, __: ApprovalDecisionCausationInvalid,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": {
+                "code": "approval_decision_causation_invalid",
+                "message": "Release must cite the exact authenticated approval.approved Event.",
+            }},
         )
 
     @app.exception_handler(PendingApprovalConflict)

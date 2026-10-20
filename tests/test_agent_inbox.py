@@ -274,9 +274,15 @@ def test_approval_boundary_moves_attention_between_agent_inboxes(client):
     assert inbox(client, "mateus")["items"] == []
     assert inbox(client, "dex")["items"] == []
 
+    approved_event = next(
+        event for event in client.get(f"/tasks/{task['id']}/events").json()
+        if event["type"] == "approval.approved"
+    )
+
     released = client.post(
         f"/tasks/{task['id']}/release",
-        json={"approval_id": approval["id"], "actor_id": "orion"},
+        json={"approval_id": approval["id"], "actor_id": "orion",
+              "causation_event_id": approved_event["id"]},
         headers={"Idempotency-Key": "release-boundary", "If-Match": '"v2"'},
     )
     assert released.status_code == 200

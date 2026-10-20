@@ -119,4 +119,26 @@ describe("Control Center human approval intent", () => {
     expect(serializedCalls).not.toContain("Authorization");
     expect(serializedCalls).not.toContain("Bearer");
   });
+
+  it("mostra factualmente uma Approval aprovada que ainda aguarda release", async () => {
+    const approval: Approval = {
+      id: "55555555-5555-4555-8555-555555555555", task_id: task.id,
+      gate: "deployment.production", status: "approved", request_reason: "Revisar deploy",
+      context: {}, requested_by: "orion", assigned_to: "mateus", decided_by: "mateus",
+      decision_reason: "Aprovado", correlation_id: task.correlation_id, version: 2,
+      created_at: task.created_at, updated_at: task.updated_at, decided_at: task.updated_at,
+    };
+    const waitingTask = { ...task, status: "waiting_approval" as const,
+      waiting_on_approval_id: approval.id, version: 2 };
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.includes(`/tasks/${task.id}`)) return json(waitingTask);
+      return json({ items: [approval], next_cursor: null });
+    });
+    const user = userEvent.setup();
+    render(<MemoryRouter initialEntries={["/approvals"]}><App /></MemoryRouter>);
+    await user.selectOptions(await screen.findByLabelText("Status"), "approved");
+    expect(await screen.findByText("Approval aprovada; Task ainda aguarda release.")).toBeInTheDocument();
+    expect(screen.queryByText("Solicitar aprovação")).not.toBeInTheDocument();
+  });
 });
