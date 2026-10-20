@@ -89,3 +89,15 @@ export interface ApprovalIntent {
   public_error: string | null;
   replayed: boolean | null;
 }
+
+export type OperationKind = "approval_intent" | "release" | "runner" | "outbox";
+export interface SourceStatus { source_id: string; kind: OperationKind; status: "available" | "unavailable" | "incompatible"; observed_at: string; public_error_code: string | null; }
+export interface OperationalItem {
+  operation_id: string; source_id: string; kind: OperationKind; persisted_state: string;
+  attention_class: string; recovery_mode: string; task_id: string | null;
+  approval_id: string | null; correlation_id: string | null; logical_owner: string;
+  created_at: string | null; state_observed_at: string | null;
+  timestamp_quality: "exact" | "lower_bound" | "unknown"; last_http_status: number | null;
+  public_error_code: string | null; evidence: string[]; summary: string;
+}
+export interface OperationalPage { items: OperationalItem[]; next_cursor: string | null; sources: SourceStatus[]; snapshot_scope: "per_request_not_global"; }
