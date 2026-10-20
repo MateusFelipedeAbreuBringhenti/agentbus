@@ -189,3 +189,54 @@ def test_release_and_outbox_projection_use_composite_ids_and_closed_facts(tmp_pa
         assert outbox_item["persisted_state"] == "unconfirmed"
         assert outbox_item["attention_class"] == "insufficient_evidence"
     agentbus.close()
+
+
+def test_agentbus_network_failure_degrades_only_canonical_enrichment(tmp_path):
+    journal = tmp_path / "runner-network.sqlite3"
+    with sqlite3.connect(journal) as db:
+        db.execute("""CREATE TABLE executions(task_id TEXT, runner_instance_id TEXT,
+            claimed_etag TEXT, claim_rejected_at TEXT, result_kind TEXT, reported_at TEXT,
+            created_at TEXT, updated_at TEXT)""")
+        db.execute("INSERT INTO executions VALUES(?,?,?,?,?,?,?,?)", ("task-network", "runner-x", None, None, None, None, "2026-10-20T00:00:00+00:00", "2026-10-20T00:00:00+00:00"))
+    manifest = _manifest(tmp_path, [{"source_id": "runner", "kind": "runner", "path": str(journal), "logical_owner": "dex"}])
+    def offline(request: httpx.Request): raise httpx.ConnectError("offline", request=request)
+    agentbus = AgentBusReadClient("http://127.0.0.1:8000", "a" * 32, transport=httpx.MockTransport(offline))
+    app = create_projection_app(projection=OperationalProjection(manifest, agentbus), reader_token=TOKEN)
+    with TestClient(app) as client:
+        response = client.get("/operations", headers={"Authorization": f"Bearer {TOKEN}"})
+        assert response.status_code == 200
+        body = response.json(); assert body["sources"][0]["status"] == "available"
+        assert body["items"][0]["attention_class"] == "insufficient_evidence"
+        assert "agentbus.task_lookup_unavailable" in body["items"][0]["evidence"]
+    agentbus.close()
+
+
+def test_valid_source_over_ten_thousand_rows_remains_available(tmp_path):
+    journal = tmp_path / "large.sqlite3"; _approval_journal(journal, rows=0)
+    with sqlite3.connect(journal) as db:
+        db.executemany("INSERT INTO approval_intents VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+            (f"intent-{number}", f"approval-{number}", f"task-{number}", f"corr-{number}",
+             "pending", "2026-10-20T00:00:00+00:00", None, None, None, "mateus",
+             None, None, None, None) for number in range(10001)
+        ])
+    agentbus, app = _app(tmp_path, [{"source_id": "large", "kind": "approval_intent", "path": str(journal), "logical_owner": "human"}])
+    with TestClient(app) as client:
+        body = client.get("/operations?limit=1", headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert body["sources"][0]["status"] == "available"
+        assert len(body["items"]) == 1 and body["next_cursor"] is not None
+    agentbus.close()
+
+
+def test_replaced_allowlisted_path_is_unavailable_and_symlink_is_not_followed(tmp_path):
+    journal = tmp_path / "allowed.sqlite3"; _approval_journal(journal, rows=1)
+    agentbus, app = _app(tmp_path, [{"source_id": "allowed", "kind": "approval_intent", "path": str(journal), "logical_owner": "human"}])
+    replacement = tmp_path / "replacement.sqlite3"; _approval_journal(replacement, rows=1)
+    with sqlite3.connect(replacement) as db:
+        db.execute("UPDATE approval_intents SET intent_id='unexpected-target'")
+    journal.unlink(); journal.symlink_to(replacement)
+    with TestClient(app) as client:
+        body = client.get("/operations", headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert body["items"] == []
+        assert body["sources"][0]["status"] == "unavailable"
+        assert "unexpected-target" not in json.dumps(body)
+    agentbus.close()

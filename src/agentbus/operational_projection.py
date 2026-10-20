@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import closing
+from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
 import hmac
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
@@ -147,39 +148,74 @@ class AgentBusReadClient:
         if "task:read:any" not in permissions or not permissions.issubset(allowed):
             raise RuntimeError("Operational AgentBus principal must be read-only.")
 
-    def get_task(self, task_id: str) -> dict[str, Any] | None:
-        response = self.client.get(f"/tasks/{task_id}")
-        if response.status_code != 200: return None
+    def get_task(self, task_id: str) -> tuple[dict[str, Any] | None, str]:
+        try:
+            response = self.client.get(f"/tasks/{task_id}")
+        except httpx.RequestError:
+            return None, "agentbus.task_lookup_unavailable"
+        if response.status_code != 200:
+            return None, ("agentbus.task_not_found" if response.status_code == 404
+                          else "agentbus.task_lookup_unavailable")
         try:
             body = response.json()
         except ValueError:
-            return None
-        return body if isinstance(body, dict) and body.get("id") == task_id else None
+            return None, "agentbus.task_response_invalid"
+        if not isinstance(body, dict) or body.get("id") != task_id:
+            return None, "agentbus.task_response_invalid"
+        return body, "agentbus.task"
+
+
+class SourceUnavailable(RuntimeError): pass
+class SourceIncompatible(RuntimeError): pass
 
 
 class OperationalProjection:
     def __init__(self, manifest: ProjectionManifest, agentbus: AgentBusReadClient):
         self.manifest = manifest
         self.agentbus = agentbus
+        self._identities: dict[str, tuple[int, int] | None] = {}
+        for source in manifest.sources:
+            try:
+                metadata = os.lstat(source.path)
+            except OSError:
+                self._identities[source.source_id] = None
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("Configured journal must be a regular non-symlink file.")
+            self._identities[source.source_id] = (metadata.st_dev, metadata.st_ino)
 
-    @staticmethod
-    def _connect(path: str) -> sqlite3.Connection:
-        uri = f"file:{quote(path, safe='/')}?mode=ro"
-        db = sqlite3.connect(uri, uri=True, timeout=1, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA query_only=ON")
-        return db
+    @contextmanager
+    def _connect(self, source: SourceConfig):
+        expected = self._identities[source.source_id]
+        if expected is None:
+            raise SourceUnavailable
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"): flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(source.path, flags)
+        except OSError:
+            raise SourceUnavailable from None
+        db = None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != expected:
+                raise SourceUnavailable
+            uri = f"file:{quote(f'/proc/self/fd/{descriptor}', safe='/')}?mode=ro"
+            db = sqlite3.connect(uri, uri=True, timeout=1, isolation_level=None)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            yield db
+        finally:
+            if db is not None: db.close()
+            os.close(descriptor)
 
     def _rows(self, source: SourceConfig) -> list[sqlite3.Row]:
         table, required = SCHEMAS[source.kind]
-        with closing(self._connect(source.path)) as db:
+        with self._connect(source) as db:
             columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
             if not required.issubset(columns):
-                raise RuntimeError("incompatible")
-            rows = db.execute(f"SELECT {','.join(sorted(required))} FROM {table} LIMIT 10001").fetchall()
-            if len(rows) > 10000:
-                raise RuntimeError("incompatible")
-            return rows
+                raise SourceIncompatible
+            return db.execute(f"SELECT {','.join(sorted(required))} FROM {table}").fetchall()
 
     def _item(self, source: SourceConfig, row: sqlite3.Row) -> OperationalItem:
         data = dict(row)
@@ -216,7 +252,7 @@ class OperationalProjection:
         elif source.kind == "runner":
             native, task_id = data["task_id"], data["task_id"]
             approval_id = None
-            task = self.agentbus.get_task(task_id)
+            task, task_evidence = self.agentbus.get_task(task_id)
             correlation_id = task.get("correlation_id") if task else None
             if data["claim_rejected_at"]:
                 state, attention, recovery, summary, observed = "claim_rejected", "terminal_stopped", "none", "Outra instância venceu o claim.", data["claim_rejected_at"]
@@ -228,16 +264,16 @@ class OperationalProjection:
                 state, attention, recovery, summary, observed = "execution_unconfirmed", "active_or_ambiguous", "conditional_executor_resume", "Execução ativa ou interrompida; retomada depende do executor.", data["updated_at"]
             else:
                 state, attention, recovery, summary, observed = "claim_prepared", "recoverable_exact_replay", "exact_command_replay", "Claim preparado e ainda não confirmado.", data["updated_at"]
-            evidence = ("journal.task_id", "agentbus.task" if task else "agentbus.task_unavailable")
+            evidence = ("journal.task_id", task_evidence)
         else:
             native, task_id, approval_id = data["coordination_id"], data["predecessor_task_id"], None
-            task = self.agentbus.get_task(task_id)
+            task, task_evidence = self.agentbus.get_task(task_id)
             correlation_id = task.get("correlation_id") if task else None
             if data["confirmed_at"]:
                 state, attention, recovery, summary, observed = "confirmed", "terminal_success", "none", "Task sucessora confirmada.", data["confirmed_at"]
             else:
                 state, attention, recovery, summary, observed = "unconfirmed", "recoverable_exact_replay", "startup_replay", "Comando sucessor ainda não confirmado.", data["created_at"]
-            evidence = ("journal.predecessor_task_id", "journal.successor_task_id" if data["successor_task_id"] else "journal.successor_unconfirmed", "agentbus.task" if task else "agentbus.task_unavailable")
+            evidence = ("journal.predecessor_task_id", "journal.successor_task_id" if data["successor_task_id"] else "journal.successor_unconfirmed", task_evidence)
         quality = "exact" if observed else "unknown"
         if not correlation_id and source.kind in {"runner", "outbox"}:
             attention, summary = "insufficient_evidence", "Task canônica indisponível; correlação não comprovada."
@@ -261,10 +297,10 @@ class OperationalProjection:
             try:
                 rows = self._rows(source)
                 source_items = [self._item(source, row) for row in rows]
-            except (OSError, sqlite3.Error):
+            except (SourceUnavailable, OSError, sqlite3.Error):
                 statuses.append(SourceStatus(source_id=source.source_id, kind=source.kind, status="unavailable", observed_at=observed, public_error_code="source_unavailable"))
                 continue
-            except (RuntimeError, KeyError, TypeError, ValueError):
+            except (SourceIncompatible, RuntimeError, KeyError, TypeError, ValueError):
                 statuses.append(SourceStatus(source_id=source.source_id, kind=source.kind, status="incompatible", observed_at=observed, public_error_code="source_incompatible"))
                 continue
             items.extend(source_items)

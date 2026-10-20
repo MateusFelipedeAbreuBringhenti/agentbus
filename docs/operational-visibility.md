@@ -5,6 +5,14 @@ only explicitly configured Approval Intent, Release, Runner, and Coordinator
 Outbox SQLite journals. It never discovers files, executes recovery, or writes
 to a journal.
 
+For each source present at startup, the service records its device and inode.
+Every read opens the path with `O_NOFOLLOW`, requires a regular file, compares
+that descriptor identity, and keeps the descriptor open while SQLite reads it
+through `/proc/self/fd` in `mode=ro`. A missing or replaced source is reported
+as unavailable and is not adopted until restart with a validated manifest.
+This implementation therefore targets Linux, like the existing `flock`-based
+Runner and release controls.
+
 ## Manifest
 
 The manifest must be an absolute mode-`0600` JSON file. Every source id and
@@ -42,6 +50,12 @@ command bodies, payloads, hashes, idempotency keys, attempt ids, tokens, and
 filesystem paths. Missing sources are `unavailable`; known tables with an
 unexpected schema or state are `incompatible`. One failed source does not hide
 the others.
+
+Temporary AgentBus connection failures degrade only Runner/outbox canonical
+enrichment to `insufficient_evidence`; they do not hide healthy journal facts.
+The projection has no row-count cutoff that reclassifies a valid schema as
+incompatible. HTTP pagination limits returned data, but each request is still
+a fresh aggregation rather than a durable global snapshot.
 
 Pagination is deterministic for one query and its filter-bound cursor. Each
 request reads the configured journals independently; there is no global
