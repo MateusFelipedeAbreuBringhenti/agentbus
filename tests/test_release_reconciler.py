@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -14,6 +15,7 @@ from agentbus.release_reconciler import (
     AmbiguousRelease,
     ReconciliationError,
     ReconciliationStopped,
+    ReleaseBusy,
     ReleaseJournal,
     ReleasePolicy,
     ReleaseReconciler,
@@ -293,6 +295,69 @@ def test_journal_compare_and_swap_prevents_two_simultaneous_sends(tmp_path):
         assert first["state"] == "sending"
         with pytest.raises(ReconciliationStopped, match="concurrently"):
             journal.begin_send(approval["id"], expected_revision=current["revision"])
+
+
+def test_process_lock_prevents_concurrent_http_recovery_send(tmp_path):
+    with TestClient(create_app(tmp_path / "bus.sqlite3", authenticator=_registry(tmp_path))) as api:
+        task, approval = _approved(api)
+        request_entered = threading.Event()
+        allow_response = threading.Event()
+        release_requests = 0
+        counter_lock = threading.Lock()
+
+        def handler(request: httpx.Request):
+            nonlocal release_requests
+            response = api.request(
+                request.method, request.url.path, params=dict(request.url.params),
+                content=request.content, headers=dict(request.headers),
+            )
+            if request.method == "POST" and "/release" in request.url.path:
+                with counter_lock:
+                    release_requests += 1
+                request_entered.set()
+                assert allow_response.wait(5), "test did not release the first response"
+            return httpx.Response(
+                response.status_code, content=response.content,
+                headers=dict(response.headers), request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+        journal, first_client, first = _reconciler(
+            tmp_path, api, transport=transport,
+        )
+        first_result = []
+        first_error = []
+
+        def run_first():
+            try:
+                first_result.append(first.reconcile(approval["id"]))
+            except Exception as error:  # captured for assertion in the test thread
+                first_error.append(error)
+
+        worker = threading.Thread(target=run_first)
+        worker.start()
+        assert request_entered.wait(5), "first release request did not start"
+
+        second_client = AgentBusReleaseClient(
+            "http://127.0.0.1:8000", TOKENS["rotated"], transport=transport,
+        )
+        second = ReleaseReconciler(
+            journal=ReleaseJournal(journal.path), client=second_client,
+            policy=_policy(tmp_path), expected_subject_id=SUBJECT,
+        )
+        with pytest.raises(ReleaseBusy, match="already in progress"):
+            second.recover()
+        allow_response.set()
+        worker.join(5)
+        first_client.close()
+        second_client.close()
+
+        assert not worker.is_alive()
+        assert first_error == []
+        assert first_result[0]["state"] == "completed"
+        assert release_requests == 1
+        events = api.get(f"/tasks/{task['id']}/events", headers=_headers("orion")).json()
+        assert [event["type"] for event in events].count("task.released") == 1
 
 
 def test_recovery_with_another_subject_fails_closed(tmp_path):

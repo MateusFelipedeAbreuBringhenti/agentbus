@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -30,6 +31,10 @@ class ReconciliationStopped(ReconciliationError):
 
 
 class AmbiguousRelease(ReconciliationError):
+    pass
+
+
+class ReleaseBusy(ReconciliationError):
     pass
 
 
@@ -118,6 +123,27 @@ class ReleaseJournal:
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         db.row_factory = sqlite3.Row
         return db
+
+    @contextmanager
+    def exclusive_send(self):
+        """Own the network send and its journal result across local processes."""
+        lock_path = self.path.with_name(f"{self.path.name}.send.lock")
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ReleaseBusy("Another release send is already in progress.") from None
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
     def read(self, approval_id: UUID | str) -> dict[str, Any]:
         with closing(self.connect()) as db:
@@ -412,7 +438,15 @@ class ReleaseReconciler:
         return self._send(prepared["approval_id"], identity)
 
     def _send(self, approval_id: UUID | str, identity: AuthIdentityRead) -> dict[str, Any]:
+        with self.journal.exclusive_send():
+            return self._send_exclusive(approval_id, identity)
+
+    def _send_exclusive(
+        self, approval_id: UUID | str, identity: AuthIdentityRead,
+    ) -> dict[str, Any]:
         current = self.journal.read(approval_id)
+        if current["state"] == "completed":
+            return current
         if current["expected_subject_id"] != identity.subject_id:
             self.journal.stop(approval_id, "credential_subject_changed")
             raise ReconciliationStopped("Credential subject changed during recovery.")

@@ -53,8 +53,13 @@ lost response remains `SENDING`; recovery reuses those bytes and identifiers.
 A `401` becomes `AUTH_REQUIRED` and may resume after credential rotation only
 when the new credential represents the same subject and still has permission.
 Authorization or state conflicts stop instead of constructing a new command.
-A compare-and-swap revision prevents two coordinator attempts from claiming
-the same persisted decision concurrently.
+A mode-`0600` advisory lock beside the journal gives one local process exclusive
+ownership from the attempt transition through the HTTP send and persistence of
+its response. The operating system releases the lock if the owner exits. A
+second instance fails without sending and may be invoked again after the owner
+finishes or crashes. SQLite transactions remain short and are never held during
+network I/O. Revision and `attempt_id` compare-and-swap checks additionally
+prevent stale journal updates.
 
 There is no scheduler, generic release endpoint in Orion-ops MCP, model tool,
 or human credential in this process. Selecting an Approval remains an explicit
