@@ -76,6 +76,18 @@ def create_gateway(
     def trace(correlation_id: UUID) -> Response:
         return forward(f"/correlations/{correlation_id}/trace")
 
+    @app.get("/api/approvals")
+    def approvals(
+        limit: int = Query(default=25, ge=1, le=100), cursor: str | None = None,
+        status: str | None = None, assigned_to: str | None = None,
+        task_id: UUID | None = None, correlation_id: UUID | None = None,
+    ) -> Response:
+        return forward("/approvals", locals())
+
+    @app.get("/api/approvals/{approval_id}")
+    def approval(approval_id: UUID) -> Response:
+        return forward(f"/approvals/{approval_id}")
+
     return app
 
 

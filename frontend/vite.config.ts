@@ -15,6 +15,10 @@ export default defineConfig(({ mode }) => {
         target: environment.AGENTBUS_CONTROL_CENTER_GATEWAY ?? "http://127.0.0.1:8001",
         changeOrigin: false,
       },
+      "/intent-api": {
+        target: environment.AGENTBUS_APPROVAL_INTENT_SERVICE ?? "http://127.0.0.1:8002",
+        changeOrigin: false,
+      },
     },
   },
   test: {

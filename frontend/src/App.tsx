@@ -2,8 +2,9 @@ import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import { TaskDetail } from "./pages/TaskDetail";
 import { TaskList } from "./pages/TaskList";
 import { TraceView } from "./pages/TraceView";
+import { ApprovalList } from "./pages/ApprovalList";
 
-const deferred = ["Agentes AI", "Aprovações", "Log de Auditoria", "Configurações"];
+const deferred = ["Agentes AI", "Log de Auditoria", "Configurações"];
 
 function Shell() {
   return (
@@ -14,6 +15,7 @@ function Shell() {
         <nav aria-label="Navegação principal">
           <NavLink to="/tasks">▣ <span>Tarefas</span></NavLink>
           <NavLink to="/trace">⌁ <span>Rastreamento Causal</span></NavLink>
+          <NavLink to="/approvals">◇ <span>Aprovações</span></NavLink>
           {deferred.map((label) => <span className="nav-disabled" key={label}>◇ <span>{label}</span><em>posterior</em></span>)}
         </nav>
         <div className="local-badge"><i /> SOMENTE LOCAL<small>Leitura real · sem mutações</small></div>
@@ -26,6 +28,7 @@ function Shell() {
           <Route path="/tasks/:taskId" element={<TaskDetail />} />
           <Route path="/correlations/:correlationId" element={<TraceView />} />
           <Route path="/trace" element={<TraceView />} />
+          <Route path="/approvals" element={<ApprovalList />} />
           <Route path="*" element={<Navigate to="/tasks" replace />} />
         </Routes></main>
       </div>

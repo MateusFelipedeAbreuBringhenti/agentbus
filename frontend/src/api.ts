@@ -1,4 +1,4 @@
-import type { CorrelationTrace, Task, TaskPage, TaskStatus } from "./types";
+import type { Approval, ApprovalIntent, ApprovalPage, CorrelationTrace, Task, TaskPage, TaskStatus } from "./types";
 
 export class AgentBusUnavailable extends Error {}
 
@@ -72,6 +72,35 @@ function isCorrelationTrace(value: unknown): value is CorrelationTrace {
     && value.events.every(isEvent);
 }
 
+function isApproval(value: unknown): value is Approval {
+  return isRecord(value) && typeof value.id === "string" && typeof value.task_id === "string"
+    && typeof value.gate === "string" && ["pending", "approved", "rejected"].includes(String(value.status))
+    && typeof value.request_reason === "string" && isRecord(value.context)
+    && typeof value.requested_by === "string" && isNullableString(value.assigned_to)
+    && isNullableString(value.decided_by) && isNullableString(value.decision_reason)
+    && typeof value.correlation_id === "string" && Number.isInteger(value.version)
+    && typeof value.created_at === "string" && typeof value.updated_at === "string"
+    && isNullableString(value.decided_at);
+}
+
+function isApprovalPage(value: unknown): value is ApprovalPage {
+  return isRecord(value) && Array.isArray(value.items) && value.items.every(isApproval)
+    && isNullableString(value.next_cursor);
+}
+
+function isApprovalIntent(value: unknown): value is ApprovalIntent {
+  return isRecord(value) && typeof value.intent_id === "string" && isRecord(value.approval)
+    && typeof value.approval.id === "string" && typeof value.approval.task_id === "string"
+    && typeof value.approval.gate === "string" && typeof value.approval.request_reason === "string"
+    && isNullableString(value.approval.assigned_to) && Number.isInteger(value.approval.version)
+    && ["approve", "reject"].includes(String(value.decision))
+    && ["pending", "confirmed", "sending", "completed", "stopped", "expired"].includes(String(value.state))
+    && isNullableString(value.decision_reason) && typeof value.created_at === "string"
+    && isNullableString(value.confirmed_at) && isNullableString(value.completed_at)
+    && (value.result === null || isApproval(value.result)) && isNullableString(value.public_error)
+    && (typeof value.replayed === "boolean" || value.replayed === null);
+}
+
 async function readJson<T>(
   path: string,
   decoder: Decoder<T>,
@@ -132,4 +161,42 @@ export function getTrace(id: string, signal?: AbortSignal): Promise<CorrelationT
     isCorrelationTrace,
     signal,
   );
+}
+
+export interface ApprovalFilters { assignedTo?: string; status?: string; cursor?: string; limit?: number; }
+
+export function listApprovals(filters: ApprovalFilters, signal?: AbortSignal): Promise<ApprovalPage> {
+  const params = new URLSearchParams({ limit: String(filters.limit ?? 20) });
+  if (filters.assignedTo) params.set("assigned_to", filters.assignedTo);
+  if (filters.status) params.set("status", filters.status);
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  return readJson(`/approvals?${params}`, isApprovalPage, signal);
+}
+
+let csrfToken: string | null = null;
+
+async function intentSession(refresh = false): Promise<string> {
+  if (csrfToken && !refresh) return csrfToken;
+  const response = await fetch("/intent-api/session");
+  if (!response.ok) throw new Error("Não foi possível iniciar a sessão local de intenção.");
+  const body: unknown = await response.json();
+  if (!isRecord(body) || typeof body.csrf_token !== "string") throw new Error("Sessão de intenção inválida.");
+  csrfToken = body.csrf_token;
+  return csrfToken;
+}
+
+export async function createApprovalIntent(
+  approval: Approval, decision: "approve" | "reject", reason: string | null,
+): Promise<ApprovalIntent> {
+  const intentKey = crypto.randomUUID();
+  const requestBody = JSON.stringify({ approval_id: approval.id, decision, decision_reason: reason, if_match: `"v${approval.version}"` });
+  const send = async (csrf: string) => fetch("/intent-api/approval-intents", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-AgentBus-CSRF": csrf, "Intent-Key": intentKey }, body: requestBody,
+  });
+  let response = await send(await intentSession());
+  if (response.status === 403) response = await send(await intentSession(true));
+  if (!response.ok) throw new Error(`Não foi possível registrar a intenção (HTTP ${response.status}).`);
+  const responseBody: unknown = await response.json();
+  if (!isApprovalIntent(responseBody)) throw new Error("O serviço de intenções devolveu uma resposta inválida.");
+  return responseBody;
 }

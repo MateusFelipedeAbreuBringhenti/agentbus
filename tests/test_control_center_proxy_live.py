@@ -42,7 +42,7 @@ def _start(command: list[str], environment: dict[str, str], cwd: Path) -> subpro
 
 
 def test_browser_vite_gateway_agentbus_path_preserves_api_prefix(tmp_path):
-    bus_port, gateway_port, vite_port = (_free_port() for _ in range(3))
+    bus_port, gateway_port, intent_port, vite_port = (_free_port() for _ in range(4))
     coordinator_token = "coordinator-token-000000000000000000000"
     viewer_token = "viewer-token-000000000000000000000000000"
     registry = tmp_path / "principals.json"
@@ -57,7 +57,7 @@ def test_browser_vite_gateway_agentbus_path_preserves_api_prefix(tmp_path):
             "principal_id": "viewer-1",
             "subject_id": "control-center",
             "token_sha256": token_digest(viewer_token),
-            "permissions": ["task:read:any", "event:read:any", "trace:read:any"],
+            "permissions": ["task:read:any", "event:read:any", "trace:read:any", "approval:read:any"],
         },
     ]}), encoding="utf-8")
     registry.chmod(0o600)
@@ -74,7 +74,7 @@ def test_browser_vite_gateway_agentbus_path_preserves_api_prefix(tmp_path):
         "AGENTBUS_DATABASE": str(tmp_path / "agentbus.sqlite3"),
         "AGENTBUS_AUTH_CONFIG": str(registry),
     }, ROOT)
-    gateway = vite = None
+    gateway = intent_service = vite = None
     try:
         _wait_for(f"http://127.0.0.1:{bus_port}/tasks")
         created = httpx.post(
@@ -102,11 +102,24 @@ def test_browser_vite_gateway_agentbus_path_preserves_api_prefix(tmp_path):
         }, ROOT)
         _wait_for(f"http://127.0.0.1:{gateway_port}/api/tasks")
 
+        intent_service = _start([
+            "python", "-m", "uvicorn", "agentbus.approval_intents:app",
+            "--host", "127.0.0.1", "--port", str(intent_port),
+        ], {
+            **base_env,
+            "AGENTBUS_URL": f"http://127.0.0.1:{bus_port}",
+            "AGENTBUS_CONTROL_CENTER_TOKEN_FILE": str(token_file),
+            "AGENTBUS_CONTROL_CENTER_HOST": f"127.0.0.1:{vite_port}",
+            "AGENTBUS_APPROVAL_INTENT_JOURNAL": str(tmp_path / "intents.sqlite3"),
+        }, ROOT)
+        _wait_for(f"http://127.0.0.1:{intent_port}/intent-api/session")
+
         vite = _start([
             "npm", "run", "dev", "--", "--port", str(vite_port), "--strictPort",
         ], {
             **os.environ,
             "AGENTBUS_CONTROL_CENTER_GATEWAY": f"http://127.0.0.1:{gateway_port}",
+            "AGENTBUS_APPROVAL_INTENT_SERVICE": f"http://127.0.0.1:{intent_port}",
         }, ROOT / "frontend")
         _wait_for(f"http://127.0.0.1:{vite_port}/")
         response = httpx.get(
@@ -118,8 +131,17 @@ def test_browser_vite_gateway_agentbus_path_preserves_api_prefix(tmp_path):
         )
         assert response.status_code == 200
         assert [item["id"] for item in response.json()["items"]] == [created.json()["id"]]
+        intent_session = httpx.get(
+            f"http://127.0.0.1:{vite_port}/intent-api/session",
+            headers={
+                "Origin": f"http://127.0.0.1:{vite_port}",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        assert intent_session.status_code == 200
+        assert len(intent_session.json()["csrf_token"]) >= 32
     finally:
-        for process in (vite, gateway, bus):
+        for process in (vite, intent_service, gateway, bus):
             if process is not None:
                 process.terminate()
                 try:

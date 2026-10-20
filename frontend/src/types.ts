@@ -53,3 +53,39 @@ export interface CorrelationTrace {
   tasks: Task[];
   events: Event[];
 }
+
+export type ApprovalStatus = "pending" | "approved" | "rejected";
+
+export interface Approval {
+  id: string;
+  task_id: string;
+  gate: string;
+  status: ApprovalStatus;
+  request_reason: string;
+  context: Record<string, unknown>;
+  requested_by: string;
+  assigned_to: string | null;
+  decided_by: string | null;
+  decision_reason: string | null;
+  correlation_id: string;
+  version: number;
+  created_at: string;
+  updated_at: string;
+  decided_at: string | null;
+}
+
+export interface ApprovalPage { items: Approval[]; next_cursor: string | null; }
+
+export interface ApprovalIntent {
+  intent_id: string;
+  approval: Pick<Approval, "id" | "task_id" | "gate" | "status" | "request_reason" | "assigned_to" | "version">;
+  decision: "approve" | "reject";
+  decision_reason: string | null;
+  state: "pending" | "confirmed" | "sending" | "completed" | "stopped" | "expired";
+  created_at: string;
+  confirmed_at: string | null;
+  completed_at: string | null;
+  result: Approval | null;
+  public_error: string | null;
+  replayed: boolean | null;
+}
