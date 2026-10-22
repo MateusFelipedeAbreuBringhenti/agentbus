@@ -232,6 +232,8 @@ class JournalRecord:
     reported_at: str | None
     stopped_at: str | None
     stop_code: str | None
+    auth_required_at: str | None
+    auth_error_code: str | None
     last_http_status: int | None
 
 
@@ -290,6 +292,8 @@ class RunnerJournal:
                     reported_at TEXT,
                     stopped_at TEXT,
                     stop_code TEXT,
+                    auth_required_at TEXT,
+                    auth_error_code TEXT,
                     last_http_status INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -302,6 +306,7 @@ class RunnerJournal:
             columns = {row[1] for row in self._connection.execute("PRAGMA table_info(executions)")}
             for name, definition in (
                 ("stopped_at", "TEXT"), ("stop_code", "TEXT"),
+                ("auth_required_at", "TEXT"), ("auth_error_code", "TEXT"),
                 ("last_http_status", "INTEGER"),
             ):
                 if name not in columns:
@@ -335,10 +340,11 @@ class RunnerJournal:
                 """INSERT OR IGNORE INTO executions(
                     task_id, runner_instance_id, claim_key, execution_id,
                     claimed_etag, claim_rejected_at, result_kind, result_payload_json,
-                    report_key, reported_at, stopped_at, stop_code, last_http_status,
+                    report_key, reported_at, stopped_at, stop_code,
+                    auth_required_at, auth_error_code, last_http_status,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL,
-                          NULL, NULL, NULL, ?, ?)""",
+                          NULL, NULL, NULL, NULL, NULL, ?, ?)""",
                 (
                     task_id,
                     str(self.runner_instance_id),
@@ -362,7 +368,8 @@ class RunnerJournal:
     def pending(self) -> list[JournalRecord]:
         rows = self._connection.execute(
             """SELECT * FROM executions
-            WHERE reported_at IS NULL AND claim_rejected_at IS NULL AND stopped_at IS NULL
+            WHERE reported_at IS NULL AND claim_rejected_at IS NULL
+              AND stopped_at IS NULL AND auth_required_at IS NULL
             ORDER BY created_at, task_id"""
         ).fetchall()
         return [self._record(row) for row in rows]
@@ -446,6 +453,27 @@ class RunnerJournal:
                 (now, code, http_status, now, task_id),
             )
 
+    def require_authentication(self, task_id: str, code: str = "authentication_required") -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connection:
+            self._connection.execute(
+                """UPDATE executions SET auth_required_at = ?, auth_error_code = ?,
+                    last_http_status = 401, updated_at = ?
+                WHERE task_id = ? AND reported_at IS NULL AND stopped_at IS NULL""",
+                (now, code, now, task_id),
+            )
+
+    def resume_authenticated(self) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connection:
+            self._connection.execute(
+                """UPDATE executions SET auth_required_at = NULL,
+                    auth_error_code = NULL, last_http_status = NULL, updated_at = ?
+                WHERE auth_required_at IS NOT NULL
+                  AND reported_at IS NULL AND stopped_at IS NULL""",
+                (now,),
+            )
+
     @staticmethod
     def _record(row: sqlite3.Row) -> JournalRecord:
         payload = (
@@ -466,6 +494,8 @@ class RunnerJournal:
             reported_at=row["reported_at"],
             stopped_at=row["stopped_at"],
             stop_code=row["stop_code"],
+            auth_required_at=row["auth_required_at"],
+            auth_error_code=row["auth_error_code"],
             last_http_status=row["last_http_status"],
         )
 
@@ -516,6 +546,7 @@ class AgentRunner:
         self._require_authorized(inbox)
         if inbox.status_code != 200:
             return
+        self.journal.resume_authenticated()
         for item in inbox.body.get("items", []):
             if item.get("kind") != "task":
                 continue
@@ -541,15 +572,29 @@ class AgentRunner:
                 )
             except AgentBusTransportError:
                 return
-            self._require_authorized(response)
+            if response.status_code == 401:
+                detail = response.body.get("detail", {})
+                self.journal.require_authentication(
+                    task_id, str(detail.get("code", "authentication_required"))
+                )
+                raise AgentBusAuthorizationError(
+                    "AgentBus rejected the configured runner principal."
+                )
+            if response.status_code == 403:
+                detail = response.body.get("detail", {})
+                self.journal.stop(
+                    task_id, str(detail.get("code", "authorization_denied")), 403
+                )
+                return
             if response.status_code != 200:
                 detail = response.body.get("detail", {})
-                if response.status_code == 409 and detail.get("code") in {
-                    "task_state_conflict",
-                    "task_assignment_conflict",
-                }:
-                    self.journal.reject_claim(task_id)
-                    self.journal.stop(task_id, str(detail["code"]), 409)
+                if response.status_code in {400, 404, 409, 422, 428}:
+                    code = str(detail.get("code", "terminal_protocol_error"))
+                    if response.status_code == 409 and code in {
+                        "task_state_conflict", "task_assignment_conflict",
+                    }:
+                        self.journal.reject_claim(task_id)
+                    self.journal.stop(task_id, code, response.status_code)
                 return
             etag = response.headers.get("etag")
             if etag is None:
@@ -615,6 +660,14 @@ class AgentRunner:
                 )
         except AgentBusTransportError:
             return
+        if response.status_code == 401:
+            detail = response.body.get("detail", {})
+            self.journal.require_authentication(
+                task_id, str(detail.get("code", "authentication_required"))
+            )
+            raise AgentBusAuthorizationError(
+                "AgentBus rejected the configured runner principal."
+            )
         if response.status_code == 403:
             detail = response.body.get("detail", {})
             self.journal.stop(task_id, str(detail.get("code", "authorization_denied")), 403)

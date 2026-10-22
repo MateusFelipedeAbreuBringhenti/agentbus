@@ -48,5 +48,8 @@ recuperáveis.
   `execution_id` para idempotência ou retomada.
 - Conflitos terminais ficam persistidos no journal do Runner e aparecem na
   projeção operacional. Falhas de transporte permanecem recuperáveis.
+- `401` persiste `AUTH_REQUIRED` sem alterar o comando. Uma autenticação posterior
+  do mesmo subject reabilita a tentativa com os mesmos IDs, chave, corpo e ETag;
+  `403` e conflitos permanentes ficam em `STOPPED`.
 - Não há scheduler, broker, executor arbitrário nem adoção administrativa de
   Tasks históricas neste slice.

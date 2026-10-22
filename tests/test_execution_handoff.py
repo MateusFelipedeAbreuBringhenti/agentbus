@@ -8,7 +8,10 @@ import pytest
 from agentbus.app import create_app
 from agentbus.auth import AuthRegistry, token_digest
 from agentbus.execution_policy import ExecutionPolicy
-from agentbus.runner import AgentRunner, BusResponse, DeterministicWorkExecutor, RunnerJournal
+from agentbus.runner import (
+    AgentBusAuthorizationError, AgentRunner, BusResponse,
+    DeterministicWorkExecutor, RunnerJournal,
+)
 
 
 TOKENS = {
@@ -215,8 +218,10 @@ def test_historical_running_task_without_provenance_fails_closed(tmp_path):
 class TerminalConflictClient:
     authenticated_subject_id = "dex"
 
-    def __init__(self):
+    def __init__(self, code="task_state_conflict"):
         self.task_id = str(uuid4())
+        self.code = code
+        self.claim_count = 0
 
     def get_inbox(self, _agent_id):
         return BusResponse(200, {"items": [{"kind": "task", "task": {
@@ -224,7 +229,8 @@ class TerminalConflictClient:
         }}]}, {})
 
     def claim_task(self, *_args):
-        return BusResponse(409, {"detail": {"code": "task_state_conflict"}}, {})
+        self.claim_count += 1
+        return BusResponse(409, {"detail": {"code": self.code}}, {})
 
 
 def test_runner_persists_terminal_claim_conflict_instead_of_retrying(tmp_path):
@@ -241,3 +247,116 @@ def test_runner_persists_terminal_claim_conflict_instead_of_retrying(tmp_path):
         assert record.stop_code == "task_state_conflict"
         assert record.last_http_status == 409
         assert journal.pending() == []
+
+
+@pytest.mark.parametrize("code", [
+    "task_type_not_allowed", "execution_id_conflict",
+    "execution_provenance_required", "idempotency_conflict",
+])
+def test_runner_stops_every_permanent_claim_conflict(tmp_path, code):
+    client = TerminalConflictClient(code)
+    with RunnerJournal(tmp_path / f"{code}.sqlite3") as journal:
+        runner = AgentRunner(
+            agent_id="dex", client=client, journal=journal,
+            executor=DeterministicWorkExecutor(), allowed_task_types=frozenset({"allowed"}),
+        )
+        runner.poll_once()
+        runner.poll_once()
+        record = journal.get(client.task_id)
+        assert record is not None
+        assert record.stop_code == code
+        assert record.last_http_status == 409
+        assert client.claim_count == 1
+
+
+class AuthenticationRecoveryClient:
+    authenticated_subject_id = "dex"
+
+    def __init__(self):
+        self.task_id = str(uuid4())
+        self.correlation_id = str(uuid4())
+        self.report_calls = []
+        self.reject_once = True
+
+    def get_inbox(self, _agent_id):
+        return BusResponse(200, {"items": [{"kind": "task", "task": {
+            "id": self.task_id, "type": "allowed", "status": "ready",
+        }}]}, {})
+
+    def claim_task(self, *_args):
+        return BusResponse(200, {}, {"etag": '"v2"'})
+
+    def get_task(self, _task_id):
+        return BusResponse(200, {
+            "id": self.task_id, "type": "allowed", "title": "Recover auth",
+            "description": None, "input": {}, "status": "running",
+            "correlation_id": self.correlation_id,
+        }, {"etag": '"v2"'})
+
+    def complete_task(self, *args):
+        self.report_calls.append(args)
+        if self.reject_once:
+            self.reject_once = False
+            return BusResponse(401, {"detail": {"code": "invalid_credential"}}, {})
+        return BusResponse(200, {}, {})
+
+
+def test_401_is_durable_and_recovery_reuses_exact_report_command(tmp_path):
+    client = AuthenticationRecoveryClient()
+    with RunnerJournal(tmp_path / "auth-recovery.sqlite3") as journal:
+        runner = AgentRunner(
+            agent_id="dex", client=client, journal=journal,
+            executor=DeterministicWorkExecutor(), allowed_task_types=frozenset({"allowed"}),
+        )
+        with pytest.raises(AgentBusAuthorizationError):
+            runner.poll_once()
+        suspended = journal.get(client.task_id)
+        assert suspended is not None
+        assert suspended.auth_required_at is not None
+        assert suspended.auth_error_code == "invalid_credential"
+        assert suspended.last_http_status == 401
+        assert journal.pending() == []
+
+        runner.poll_once()
+        recovered = journal.get(client.task_id)
+        assert recovered is not None
+        assert recovered.auth_required_at is None
+        assert recovered.reported_at is not None
+        assert len(client.report_calls) == 2
+        assert client.report_calls[0] == client.report_calls[1]
+
+
+class ClaimAuthenticationRecoveryClient(AuthenticationRecoveryClient):
+    def __init__(self):
+        super().__init__()
+        self.claim_calls = []
+        self.reject_claim_once = True
+        self.reject_once = False
+
+    def claim_task(self, *args):
+        self.claim_calls.append(args)
+        if self.reject_claim_once:
+            self.reject_claim_once = False
+            return BusResponse(401, {"detail": {"code": "invalid_credential"}}, {})
+        return BusResponse(200, {}, {"etag": '"v2"'})
+
+
+def test_claim_401_is_durable_and_reuses_same_execution_identity(tmp_path):
+    client = ClaimAuthenticationRecoveryClient()
+    with RunnerJournal(tmp_path / "claim-auth-recovery.sqlite3") as journal:
+        runner = AgentRunner(
+            agent_id="dex", client=client, journal=journal,
+            executor=DeterministicWorkExecutor(), allowed_task_types=frozenset({"allowed"}),
+        )
+        with pytest.raises(AgentBusAuthorizationError):
+            runner.poll_once()
+        suspended = journal.get(client.task_id)
+        assert suspended is not None
+        assert suspended.claimed_etag is None
+        assert suspended.auth_required_at is not None
+        runner.poll_once()
+        recovered = journal.get(client.task_id)
+        assert recovered is not None
+        assert recovered.reported_at is not None
+        assert len(client.claim_calls) == 2
+        assert client.claim_calls[0] == client.claim_calls[1]

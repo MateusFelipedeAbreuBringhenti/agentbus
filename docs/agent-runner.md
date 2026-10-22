@@ -34,6 +34,8 @@ Uma linha de execução preserva somente fatos locais:
 - `reported_at`, confirmação durável sem apagar o histórico.
 - `stopped_at`, `stop_code` e o status HTTP quando um conflito terminal impede
   recuperação segura.
+- `auth_required_at` preserva uma suspensão por `401` sem apagar corpo, ETag,
+  chaves ou identidade da execução.
 
 Não existe enum de fase. O estado da Task continua vindo do AgentBus.
 
@@ -46,6 +48,7 @@ Não existe enum de fase. O estado da Task continua vindo do AgentBus.
 | Antes ou durante o executor | Confirma que a Task ainda está `running` no `claimed_etag` e chama novamente com o mesmo `execution_id`. |
 | Depois do resultado | O resultado persistido é reportado sem chamar novamente o executor. |
 | Resposta de complete/fail perdida | Reenvia exatamente payload, ETag e `report_key`; o AgentBus devolve replay. |
+| Credencial rejeitada com `401` | Persiste `AUTH_REQUIRED` e suspende o comando. Depois que o inbox autentica novamente como o mesmo subject, remove apenas a suspensão e reenvia o comando original. |
 | Depois da confirmação | Preserva a linha com `reported_at`. Retenção e limpeza ficam para outro slice. |
 
 Antes de chamar o executor, o runner consulta a Task atual. Status ou ETag
