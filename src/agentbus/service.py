@@ -6,12 +6,13 @@ import binascii
 import hashlib
 import json
 import sqlite3
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel
 
 from agentbus.auth import AuthContext, ResourceAccessDenied
 from agentbus.database import Database
+from agentbus.execution_policy import ExecutionPolicy, TestExecutionPolicy
 from agentbus.models import (
     AgentInbox,
     ApprovalDecision,
@@ -96,6 +97,22 @@ class TaskAssignmentConflict(Exception):
     def __init__(self, requested: str, assigned_to: str) -> None:
         self.requested = requested
         self.assigned_to = assigned_to
+
+
+class ExecutionIdConflict(Exception):
+    pass
+
+
+class ExecutionInstanceConflict(Exception):
+    pass
+
+
+class ExecutionSubjectConflict(Exception):
+    pass
+
+
+class ExecutionProvenanceRequired(Exception):
+    pass
 
 
 class ApprovalNotFound(Exception):
@@ -188,7 +205,7 @@ def _command_request_hash(
 ) -> str:
     payload = json.dumps(
         {
-            "body": request.model_dump(mode="json"),
+            "body": request.model_dump(mode="json", exclude_none=True),
             "expected_version": expected_version,
             # Preserve persisted Slice #002 fingerprints across the v2 upgrade.
             ("task_id" if isinstance(request, (TaskClaim, TaskComplete, TaskFail))
@@ -426,6 +443,12 @@ def _task_from_row(row: sqlite3.Row) -> TaskRead:
         updated_at=row["updated_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+        execution_id=row["execution_id"] if "execution_id" in row.keys() else None,
+        runner_instance_id=(row["runner_instance_id"] if "runner_instance_id" in row.keys() else None),
+        execution_subject_id=(row["execution_subject_id"] if "execution_subject_id" in row.keys() else None),
+        claimed_principal_id=(row["claimed_principal_id"] if "claimed_principal_id" in row.keys() else None),
+        claim_policy_id=row["claim_policy_id"] if "claim_policy_id" in row.keys() else None,
+        claim_policy_sha256=(row["claim_policy_sha256"] if "claim_policy_sha256" in row.keys() else None),
     )
 
 
@@ -764,22 +787,57 @@ def claim_task(
     request: TaskClaim,
     idempotency_key: str,
     auth: AuthContext,
+    policy: ExecutionPolicy | None = None,
 ) -> TaskCommandResult:
+    policy = policy or TestExecutionPolicy()
     actor_id = request.agent_id if auth.subject_id == "*" else auth.subject_id
     scope = _command_scope(actor_id, CLAIM_TASK_OPERATION)
-    request_hash = _command_request_hash(task_id, request)
 
     with database.transaction() as connection:
-        replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
-        if replayed is not None:
-            return TaskCommandResult(task=replayed, replayed=True)
-
         row = connection.execute(
             "SELECT * FROM tasks WHERE id = ?",
             (str(task_id),),
         ).fetchone()
         if row is None:
             raise TaskNotFound
+        if auth.subject_id != "*" and row["assigned_to"] not in {None, auth.subject_id}:
+            raise ResourceAccessDenied
+        has_execution_provenance = "execution_id" in row.keys()
+        original_request_hash = _command_request_hash(task_id, request)
+        legacy_replay = None
+        if not has_execution_provenance or row["execution_id"] is None:
+            legacy_replay = _replayed_task(
+                connection, scope, idempotency_key, original_request_hash
+            )
+            if legacy_replay is not None:
+                return TaskCommandResult(task=legacy_replay, replayed=True)
+        execution_id = request.execution_id
+        runner_instance_id = request.runner_instance_id
+        if (
+            has_execution_provenance
+            and auth.subject_id == "*"
+            and execution_id is None
+            and runner_instance_id is None
+        ):
+            execution_id = uuid5(UUID(int=0), f"test:{actor_id}:{task_id}")
+            runner_instance_id = UUID(int=0)
+            request = request.model_copy(update={
+                "execution_id": execution_id, "runner_instance_id": runner_instance_id,
+            })
+        request_hash = _command_request_hash(task_id, request)
+        replayed = legacy_replay or _replayed_task(
+            connection, scope, idempotency_key, request_hash
+        )
+        if replayed is not None:
+            if has_execution_provenance and row["execution_id"] is not None:
+                if request.execution_id is None or str(request.execution_id) != row["execution_id"]:
+                    raise ExecutionIdConflict
+                if request.runner_instance_id is None or str(request.runner_instance_id) != row["runner_instance_id"]:
+                    raise ExecutionInstanceConflict
+            return TaskCommandResult(task=replayed, replayed=True)
+
+        if has_execution_provenance and (execution_id is None or runner_instance_id is None):
+            raise ExecutionProvenanceRequired
         _validate_causation(
             connection,
             request.causation_event_id,
@@ -789,18 +847,39 @@ def claim_task(
             raise TaskStateConflict(TaskStatus.READY, TaskStatus(row["status"]))
         if row["assigned_to"] is not None and row["assigned_to"] != request.agent_id:
             raise TaskAssignmentConflict(request.agent_id, row["assigned_to"])
+        if has_execution_provenance:
+            policy.require(actor_id, row["type"])
+            reused = connection.execute(
+                "SELECT id FROM tasks WHERE execution_id = ? AND id != ?",
+                (str(execution_id), str(task_id)),
+            ).fetchone()
+            if reused is not None:
+                raise ExecutionIdConflict
 
         now = datetime.now(UTC).isoformat()
-        updated = connection.execute(
-            """
-            UPDATE tasks
-            SET status = 'running', assigned_to = ?, started_at = ?,
-                updated_at = ?, version = version + 1
-            WHERE id = ? AND status = 'ready'
-              AND (assigned_to IS NULL OR assigned_to = ?)
-            """,
-            (request.agent_id, now, now, str(task_id), request.agent_id),
-        )
+        if has_execution_provenance:
+            updated = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'running', assigned_to = ?, started_at = ?,
+                    updated_at = ?, version = version + 1,
+                    execution_id = ?, runner_instance_id = ?, execution_subject_id = ?,
+                    claimed_principal_id = ?, claim_policy_id = ?, claim_policy_sha256 = ?
+                WHERE id = ? AND status = 'ready'
+                  AND (assigned_to IS NULL OR assigned_to = ?)
+                """,
+                (request.agent_id, now, now, str(execution_id), str(runner_instance_id),
+                 actor_id, auth.principal_id, policy.policy_id, policy.policy_sha256,
+                 str(task_id), request.agent_id),
+            )
+        else:
+            updated = connection.execute(
+                """UPDATE tasks SET status = 'running', assigned_to = ?, started_at = ?,
+                    updated_at = ?, version = version + 1
+                WHERE id = ? AND status = 'ready'
+                  AND (assigned_to IS NULL OR assigned_to = ?)""",
+                (request.agent_id, now, now, str(task_id), request.agent_id),
+            )
         if updated.rowcount != 1:
             current = connection.execute(
                 "SELECT status, assigned_to FROM tasks WHERE id = ?",
@@ -834,6 +913,12 @@ def claim_task(
                 "status": task.status.value,
                 "task_id": str(task.id),
                 "version": task.version,
+                "execution_id": str(execution_id),
+                "runner_instance_id": str(runner_instance_id),
+                "execution_subject_id": actor_id,
+                "task_type": task.type,
+                "policy_id": policy.policy_id,
+                "policy_sha256": policy.policy_sha256,
             },
             actor_id=actor_id,
             authenticated_principal_id=auth.principal_id,
@@ -861,6 +946,26 @@ def _assigned_task_identity(row: sqlite3.Row) -> str:
     return row["assigned_to"]
 
 
+def _validate_execution_command(
+    row: sqlite3.Row,
+    execution_id: UUID | None,
+    runner_instance_id: UUID | None,
+    auth: AuthContext,
+) -> None:
+    if "execution_id" not in row.keys():
+        return
+    if row["execution_id"] is None:
+        raise ExecutionProvenanceRequired
+    if auth.subject_id != "*" and row["execution_subject_id"] != auth.subject_id:
+        raise ExecutionSubjectConflict
+    if auth.subject_id == "*" and execution_id is None and runner_instance_id is None:
+        return
+    if execution_id is None or str(execution_id) != row["execution_id"]:
+        raise ExecutionIdConflict
+    if runner_instance_id is None or str(runner_instance_id) != row["runner_instance_id"]:
+        raise ExecutionInstanceConflict
+
+
 def complete_task(
     database: Database,
     task_id: UUID,
@@ -868,7 +973,9 @@ def complete_task(
     idempotency_key: str,
     expected_version: int,
     auth: AuthContext,
+    policy: ExecutionPolicy | None = None,
 ) -> TaskCommandResult:
+    policy = policy or TestExecutionPolicy()
     request_hash = _command_request_hash(task_id, request, expected_version)
 
     with database.transaction() as connection:
@@ -883,10 +990,18 @@ def complete_task(
         if auth.subject_id != "*" and assigned_identity != auth.subject_id:
             raise ResourceAccessDenied
         scope = _command_scope(actor_id, COMPLETE_TASK_OPERATION)
+        if "execution_id" in row.keys() and row["execution_id"] is not None:
+            _validate_execution_command(
+                row, request.execution_id, request.runner_instance_id, auth
+            )
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
         if replayed is not None:
+            if "execution_id" not in row.keys() or row["execution_id"] is None:
+                return TaskCommandResult(task=replayed, replayed=True)
             return TaskCommandResult(task=replayed, replayed=True)
 
+        _validate_execution_command(row, request.execution_id, request.runner_instance_id, auth)
+        policy.require(actor_id, row["type"])
         _validate_causation(connection, request.causation_event_id, row["correlation_id"])
         if row["status"] != TaskStatus.RUNNING.value:
             raise TaskStateConflict(TaskStatus.RUNNING, TaskStatus(row["status"]))
@@ -925,6 +1040,13 @@ def complete_task(
                 "status": task.status.value,
                 "task_id": str(task.id),
                 "version": task.version,
+                "execution_id": row["execution_id"] if "execution_id" in row.keys() else None,
+                "runner_instance_id": row["runner_instance_id"] if "runner_instance_id" in row.keys() else None,
+                "execution_subject_id": row["execution_subject_id"] if "execution_subject_id" in row.keys() else None,
+                "claim_policy_id": row["claim_policy_id"] if "claim_policy_id" in row.keys() else None,
+                "claim_policy_sha256": row["claim_policy_sha256"] if "claim_policy_sha256" in row.keys() else None,
+                "report_policy_id": policy.policy_id,
+                "report_policy_sha256": policy.policy_sha256,
             },
             actor_id=actor_id,
             authenticated_principal_id=auth.principal_id,
@@ -953,7 +1075,9 @@ def fail_task(
     idempotency_key: str,
     expected_version: int,
     auth: AuthContext,
+    policy: ExecutionPolicy | None = None,
 ) -> TaskCommandResult:
+    policy = policy or TestExecutionPolicy()
     request_hash = _command_request_hash(task_id, request, expected_version)
 
     with database.transaction() as connection:
@@ -968,10 +1092,18 @@ def fail_task(
         if auth.subject_id != "*" and assigned_identity != auth.subject_id:
             raise ResourceAccessDenied
         scope = _command_scope(actor_id, FAIL_TASK_OPERATION)
+        if "execution_id" in row.keys() and row["execution_id"] is not None:
+            _validate_execution_command(
+                row, request.execution_id, request.runner_instance_id, auth
+            )
         replayed = _replayed_task(connection, scope, idempotency_key, request_hash)
         if replayed is not None:
+            if "execution_id" not in row.keys() or row["execution_id"] is None:
+                return TaskCommandResult(task=replayed, replayed=True)
             return TaskCommandResult(task=replayed, replayed=True)
 
+        _validate_execution_command(row, request.execution_id, request.runner_instance_id, auth)
+        policy.require(actor_id, row["type"])
         _validate_causation(connection, request.causation_event_id, row["correlation_id"])
         if row["status"] != TaskStatus.RUNNING.value:
             raise TaskStateConflict(TaskStatus.RUNNING, TaskStatus(row["status"]))
@@ -1012,6 +1144,13 @@ def fail_task(
                 "status": task.status.value,
                 "task_id": str(task.id),
                 "version": task.version,
+                "execution_id": row["execution_id"] if "execution_id" in row.keys() else None,
+                "runner_instance_id": row["runner_instance_id"] if "runner_instance_id" in row.keys() else None,
+                "execution_subject_id": row["execution_subject_id"] if "execution_subject_id" in row.keys() else None,
+                "claim_policy_id": row["claim_policy_id"] if "claim_policy_id" in row.keys() else None,
+                "claim_policy_sha256": row["claim_policy_sha256"] if "claim_policy_sha256" in row.keys() else None,
+                "report_policy_id": policy.policy_id,
+                "report_policy_sha256": policy.policy_sha256,
             },
             actor_id=actor_id,
             authenticated_principal_id=auth.principal_id,

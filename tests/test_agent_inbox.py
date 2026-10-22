@@ -361,4 +361,4 @@ def test_existing_v1_assigned_task_survives_upgrade_and_appears_in_inbox(
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,)]
+            ).fetchall() == [(1,), (2,), (3,), (4,), (5,)]

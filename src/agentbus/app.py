@@ -17,6 +17,7 @@ from agentbus.auth import (
 )
 
 from agentbus.database import Database
+from agentbus.execution_policy import ExecutionPolicy, TaskTypeNotAllowed, TestExecutionPolicy
 from agentbus.models import (
     AgentInbox,
     ApprovalDecision,
@@ -59,6 +60,10 @@ from agentbus.service import (
     TaskAssignmentConflict,
     TaskStateConflict,
     TaskVersionConflict,
+    ExecutionIdConflict,
+    ExecutionInstanceConflict,
+    ExecutionSubjectConflict,
+    ExecutionProvenanceRequired,
     claim_task,
     complete_task,
     create_task,
@@ -156,20 +161,34 @@ def create_app(
     database_path: str | Path | None = None,
     *,
     authenticator: Authenticator | None = None,
+    execution_policy: ExecutionPolicy | None = None,
 ) -> FastAPI:
     path = database_path or os.environ.get("AGENTBUS_DATABASE", "agentbus.sqlite3")
     database = Database(path)
     auth_backend = authenticator or EnvironmentAuthenticator()
+    policy = execution_policy
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        nonlocal policy
         if isinstance(auth_backend, EnvironmentAuthenticator):
             auth_backend.load()
+            policy_path = os.environ.get("AGENTBUS_EXECUTION_POLICY")
+            if not policy_path:
+                raise RuntimeError("AGENTBUS_EXECUTION_POLICY is required.")
+            policy = ExecutionPolicy.from_file(policy_path)
+        elif policy is None:
+            policy = TestExecutionPolicy()
         database.migrate()
         yield
 
     app = FastAPI(title="AgentBus", version="0.1.0", lifespan=lifespan)
     app.state.database = database
+
+    def active_policy() -> ExecutionPolicy:
+        if policy is None:
+            raise RuntimeError("Execution policy was not loaded.")
+        return policy
 
     def authenticated(
         authorization: Annotated[str | None, Header(alias="Authorization")] = None,
@@ -504,6 +523,32 @@ def create_app(
             },
         )
 
+    def execution_conflict(code: str, message: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": {"code": code, "message": message}},
+        )
+
+    @app.exception_handler(TaskTypeNotAllowed)
+    async def task_type_not_allowed_handler(_: Request, __: TaskTypeNotAllowed) -> JSONResponse:
+        return execution_conflict("task_type_not_allowed", "Execution policy does not allow this Task type.")
+
+    @app.exception_handler(ExecutionIdConflict)
+    async def execution_id_conflict_handler(_: Request, __: ExecutionIdConflict) -> JSONResponse:
+        return execution_conflict("execution_id_conflict", "Execution id differs from the Task binding.")
+
+    @app.exception_handler(ExecutionInstanceConflict)
+    async def execution_instance_conflict_handler(_: Request, __: ExecutionInstanceConflict) -> JSONResponse:
+        return execution_conflict("execution_instance_conflict", "Runner instance differs from the Task binding.")
+
+    @app.exception_handler(ExecutionSubjectConflict)
+    async def execution_subject_conflict_handler(_: Request, __: ExecutionSubjectConflict) -> JSONResponse:
+        return execution_conflict("execution_subject_conflict", "Execution belongs to another subject.")
+
+    @app.exception_handler(ExecutionProvenanceRequired)
+    async def execution_provenance_required_handler(_: Request, __: ExecutionProvenanceRequired) -> JSONResponse:
+        return execution_conflict("execution_provenance_required", "Task has no verified execution provenance.")
+
     @app.post("/tasks", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
     def create_task_endpoint(
         task: TaskCreate,
@@ -613,7 +658,7 @@ def create_app(
     ) -> JSONResponse:
         require(auth, "task:claim:self")
         same_subject(auth, command.agent_id)
-        result = claim_task(database, task_id, command, idempotency_key, auth)
+        result = claim_task(database, task_id, command, idempotency_key, auth, active_policy())
         return _task_response(
             result.task,
             status_code=status.HTTP_200_OK,
@@ -640,6 +685,7 @@ def create_app(
             idempotency_key,
             _expected_version(if_match),
             auth,
+            active_policy(),
         )
         return _task_response(
             result.task,
@@ -667,6 +713,7 @@ def create_app(
             idempotency_key,
             _expected_version(if_match),
             auth,
+            active_policy(),
         )
         return _task_response(
             result.task,

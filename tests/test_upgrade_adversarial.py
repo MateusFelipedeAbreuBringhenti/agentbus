@@ -36,7 +36,7 @@ def test_v1_replays_survive_v2_upgrade(tmp_path, monkeypatch, terminal):
     # Encode the actual Slice #002 persisted wire format, independent of current helper.
     with sqlite3.connect(path) as connection:
         for key, command, version in [('claim', claim_body, None), ('terminal', body, 2)]:
-            payload = json.dumps({'body': command.model_dump(mode='json'), 'expected_version': version,
+            payload = json.dumps({'body': command.model_dump(mode='json', exclude_none=True), 'expected_version': version,
                                   'task_id': str(task.id)}, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
             connection.execute('UPDATE idempotency_records SET request_hash=? WHERE key=?',
                                (hashlib.sha256(payload.encode()).hexdigest(), key))
@@ -48,13 +48,16 @@ def test_v1_replays_survive_v2_upgrade(tmp_path, monkeypatch, terminal):
             headers = {'Idempotency-Key': key}
             if version:
                 headers['If-Match'] = f'"v{version}"'
-            response = api.post(f'/tasks/{task.id}/{action}', json=command.model_dump(mode='json'), headers=headers)
+            response = api.post(
+                f'/tasks/{task.id}/{action}',
+                json=command.model_dump(mode='json', exclude_none=True), headers=headers,
+            )
             assert response.status_code == 200
             assert response.json() == expected.model_dump(mode='json')
             assert response.headers['Idempotency-Replayed'] == 'true'
     with closing(sqlite3.connect(path)) as connection:
         assert connection.execute('SELECT count(*) FROM events').fetchone()[0] == 3
-        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,)]
+        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,), (5,)]
 
 
 def test_two_migrators_recheck_version_after_acquiring_write_lock(tmp_path, monkeypatch):
@@ -78,7 +81,7 @@ def test_two_migrators_recheck_version_after_acquiring_write_lock(tmp_path, monk
         for future in futures:
             future.result(timeout=10)
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,)]
+        assert connection.execute('SELECT version FROM schema_migrations ORDER BY version').fetchall() == [(1,), (2,), (3,), (4,), (5,)]
 
 
 def test_failed_v2_migration_rolls_back_schema_and_can_retry(tmp_path, monkeypatch):

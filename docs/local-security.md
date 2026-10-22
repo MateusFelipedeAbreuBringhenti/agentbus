@@ -1,7 +1,7 @@
 # Local authentication and authorization
 
-AgentBus has no anonymous compatibility mode. `AGENTBUS_AUTH_CONFIG` must name an
-absolute, mode-`0600` JSON file. The server validates the complete immutable snapshot
+AgentBus has no anonymous compatibility mode. `AGENTBUS_AUTH_CONFIG` and
+`AGENTBUS_EXECUTION_POLICY` must name absolute, mode-`0600` JSON files. The server validates the complete immutable snapshot
 at startup and fails closed for missing files, malformed hashes, duplicate principals,
 or unknown permissions.
 
@@ -37,6 +37,7 @@ Example startup variables:
 ```text
 AGENTBUS_DATABASE=/absolute/path/agentbus.sqlite3
 AGENTBUS_AUTH_CONFIG=/absolute/private/path/principals.json
+AGENTBUS_EXECUTION_POLICY=/absolute/private/path/execution-policy.json
 AGENTBUS_CONTROL_CENTER_TOKEN_FILE=/absolute/private/path/control-center.token
 AGENTBUS_ORION_OPS_TOKEN_FILE=/absolute/private/path/orion-ops.token
 ```

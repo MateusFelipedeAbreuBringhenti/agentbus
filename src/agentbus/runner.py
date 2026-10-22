@@ -48,6 +48,8 @@ class AgentBusClient(Protocol):
         task_id: str,
         agent_id: str,
         idempotency_key: str,
+        execution_id: str,
+        runner_instance_id: str,
     ) -> BusResponse: ...
 
     def complete_task(
@@ -56,6 +58,8 @@ class AgentBusClient(Protocol):
         output: dict[str, Any],
         idempotency_key: str,
         if_match: str,
+        execution_id: str,
+        runner_instance_id: str,
     ) -> BusResponse: ...
 
     def fail_task(
@@ -65,6 +69,8 @@ class AgentBusClient(Protocol):
         failure_message: str,
         idempotency_key: str,
         if_match: str,
+        execution_id: str,
+        runner_instance_id: str,
     ) -> BusResponse: ...
 
 
@@ -113,11 +119,14 @@ class HttpAgentBusClient:
         task_id: str,
         agent_id: str,
         idempotency_key: str,
+        execution_id: str,
+        runner_instance_id: str,
     ) -> BusResponse:
         return self._request(
             "POST",
             f"/tasks/{task_id}/claim",
-            json={"agent_id": agent_id},
+            json={"agent_id": agent_id, "execution_id": execution_id,
+                  "runner_instance_id": runner_instance_id},
             headers={"Idempotency-Key": idempotency_key},
         )
 
@@ -127,11 +136,14 @@ class HttpAgentBusClient:
         output: dict[str, Any],
         idempotency_key: str,
         if_match: str,
+        execution_id: str,
+        runner_instance_id: str,
     ) -> BusResponse:
         return self._request(
             "POST",
             f"/tasks/{task_id}/complete",
-            json={"output": output},
+            json={"output": output, "execution_id": execution_id,
+                  "runner_instance_id": runner_instance_id},
             headers={"Idempotency-Key": idempotency_key, "If-Match": if_match},
         )
 
@@ -142,6 +154,8 @@ class HttpAgentBusClient:
         failure_message: str,
         idempotency_key: str,
         if_match: str,
+        execution_id: str,
+        runner_instance_id: str,
     ) -> BusResponse:
         return self._request(
             "POST",
@@ -149,6 +163,8 @@ class HttpAgentBusClient:
             json={
                 "failure_code": failure_code,
                 "failure_message": failure_message,
+                "execution_id": execution_id,
+                "runner_instance_id": runner_instance_id,
             },
             headers={"Idempotency-Key": idempotency_key, "If-Match": if_match},
         )
@@ -214,6 +230,11 @@ class JournalRecord:
     result_payload: dict[str, Any] | None
     report_key: str | None
     reported_at: str | None
+    stopped_at: str | None
+    stop_code: str | None
+    auth_required_at: str | None
+    auth_error_code: str | None
+    last_http_status: int | None
 
 
 class RunnerJournal:
@@ -269,6 +290,11 @@ class RunnerJournal:
                     result_payload_json TEXT,
                     report_key TEXT UNIQUE,
                     reported_at TEXT,
+                    stopped_at TEXT,
+                    stop_code TEXT,
+                    auth_required_at TEXT,
+                    auth_error_code TEXT,
+                    last_http_status INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     CHECK ((result_kind IS NULL) = (result_payload_json IS NULL)),
@@ -277,6 +303,14 @@ class RunnerJournal:
                     CHECK (reported_at IS NULL OR report_key IS NOT NULL)
                 )"""
             )
+            columns = {row[1] for row in self._connection.execute("PRAGMA table_info(executions)")}
+            for name, definition in (
+                ("stopped_at", "TEXT"), ("stop_code", "TEXT"),
+                ("auth_required_at", "TEXT"), ("auth_error_code", "TEXT"),
+                ("last_http_status", "INTEGER"),
+            ):
+                if name not in columns:
+                    self._connection.execute(f"ALTER TABLE executions ADD COLUMN {name} {definition}")
 
     def _load_or_create_identity(self, requested: UUID | None) -> UUID:
         row = self._connection.execute(
@@ -306,8 +340,11 @@ class RunnerJournal:
                 """INSERT OR IGNORE INTO executions(
                     task_id, runner_instance_id, claim_key, execution_id,
                     claimed_etag, claim_rejected_at, result_kind, result_payload_json,
-                    report_key, reported_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)""",
+                    report_key, reported_at, stopped_at, stop_code,
+                    auth_required_at, auth_error_code, last_http_status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL,
+                          NULL, NULL, NULL, NULL, NULL, ?, ?)""",
                 (
                     task_id,
                     str(self.runner_instance_id),
@@ -332,6 +369,7 @@ class RunnerJournal:
         rows = self._connection.execute(
             """SELECT * FROM executions
             WHERE reported_at IS NULL AND claim_rejected_at IS NULL
+              AND stopped_at IS NULL AND auth_required_at IS NULL
             ORDER BY created_at, task_id"""
         ).fetchall()
         return [self._record(row) for row in rows]
@@ -405,6 +443,37 @@ class RunnerJournal:
                 (now, now, task_id),
             )
 
+    def stop(self, task_id: str, code: str, http_status: int) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connection:
+            self._connection.execute(
+                """UPDATE executions SET stopped_at = ?, stop_code = ?,
+                    last_http_status = ?, updated_at = ?
+                WHERE task_id = ? AND reported_at IS NULL""",
+                (now, code, http_status, now, task_id),
+            )
+
+    def require_authentication(self, task_id: str, code: str = "authentication_required") -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connection:
+            self._connection.execute(
+                """UPDATE executions SET auth_required_at = ?, auth_error_code = ?,
+                    last_http_status = 401, updated_at = ?
+                WHERE task_id = ? AND reported_at IS NULL AND stopped_at IS NULL""",
+                (now, code, now, task_id),
+            )
+
+    def resume_authenticated(self) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connection:
+            self._connection.execute(
+                """UPDATE executions SET auth_required_at = NULL,
+                    auth_error_code = NULL, last_http_status = NULL, updated_at = ?
+                WHERE auth_required_at IS NOT NULL
+                  AND reported_at IS NULL AND stopped_at IS NULL""",
+                (now,),
+            )
+
     @staticmethod
     def _record(row: sqlite3.Row) -> JournalRecord:
         payload = (
@@ -423,6 +492,11 @@ class RunnerJournal:
             result_payload=payload,
             report_key=row["report_key"],
             reported_at=row["reported_at"],
+            stopped_at=row["stopped_at"],
+            stop_code=row["stop_code"],
+            auth_required_at=row["auth_required_at"],
+            auth_error_code=row["auth_error_code"],
+            last_http_status=row["last_http_status"],
         )
 
 
@@ -434,6 +508,7 @@ class AgentRunner:
         client: AgentBusClient,
         journal: RunnerJournal,
         executor: WorkExecutor,
+        allowed_task_types: frozenset[str],
     ) -> None:
         authenticated_subject = getattr(client, "authenticated_subject_id", agent_id)
         if authenticated_subject != agent_id:
@@ -444,6 +519,9 @@ class AgentRunner:
         self.client = client
         self.journal = journal
         self.executor = executor
+        if not allowed_task_types or "*" in allowed_task_types:
+            raise ValueError("Runner requires an explicit closed Task type allowlist.")
+        self.allowed_task_types = allowed_task_types
 
     def run_forever(
         self,
@@ -468,11 +546,12 @@ class AgentRunner:
         self._require_authorized(inbox)
         if inbox.status_code != 200:
             return
+        self.journal.resume_authenticated()
         for item in inbox.body.get("items", []):
             if item.get("kind") != "task":
                 continue
             task = item["task"]
-            if task["status"] == "ready":
+            if task["status"] == "ready" and task.get("type") in self.allowed_task_types:
                 self.journal.prepare(task["id"])
 
         for record in self.journal.pending():
@@ -488,17 +567,34 @@ class AgentRunner:
                     task_id,
                     self.agent_id,
                     record.claim_key,
+                    record.execution_id,
+                    record.runner_instance_id,
                 )
             except AgentBusTransportError:
                 return
-            self._require_authorized(response)
+            if response.status_code == 401:
+                detail = response.body.get("detail", {})
+                self.journal.require_authentication(
+                    task_id, str(detail.get("code", "authentication_required"))
+                )
+                raise AgentBusAuthorizationError(
+                    "AgentBus rejected the configured runner principal."
+                )
+            if response.status_code == 403:
+                detail = response.body.get("detail", {})
+                self.journal.stop(
+                    task_id, str(detail.get("code", "authorization_denied")), 403
+                )
+                return
             if response.status_code != 200:
                 detail = response.body.get("detail", {})
-                if response.status_code == 409 and detail.get("code") in {
-                    "task_state_conflict",
-                    "task_assignment_conflict",
-                }:
-                    self.journal.reject_claim(task_id)
+                if response.status_code in {400, 404, 409, 422, 428}:
+                    code = str(detail.get("code", "terminal_protocol_error"))
+                    if response.status_code == 409 and code in {
+                        "task_state_conflict", "task_assignment_conflict",
+                    }:
+                        self.journal.reject_claim(task_id)
+                    self.journal.stop(task_id, code, response.status_code)
                 return
             etag = response.headers.get("etag")
             if etag is None:
@@ -519,6 +615,9 @@ class AgentRunner:
                 current.body.get("status") != "running"
                 or current.headers.get("etag") != record.claimed_etag
             ):
+                return
+            if current.body.get("type") not in self.allowed_task_types:
+                self.journal.stop(task_id, "task_type_not_allowed", 409)
                 return
             request = ExecutionRequest(
                 execution_id=UUID(record.execution_id),
@@ -546,6 +645,8 @@ class AgentRunner:
                     record.result_payload["output"],
                     record.report_key,
                     record.claimed_etag,
+                    record.execution_id,
+                    record.runner_instance_id,
                 )
             else:
                 response = self.client.fail_task(
@@ -554,12 +655,33 @@ class AgentRunner:
                     record.result_payload["failure_message"],
                     record.report_key,
                     record.claimed_etag,
+                    record.execution_id,
+                    record.runner_instance_id,
                 )
         except AgentBusTransportError:
+            return
+        if response.status_code == 401:
+            detail = response.body.get("detail", {})
+            self.journal.require_authentication(
+                task_id, str(detail.get("code", "authentication_required"))
+            )
+            raise AgentBusAuthorizationError(
+                "AgentBus rejected the configured runner principal."
+            )
+        if response.status_code == 403:
+            detail = response.body.get("detail", {})
+            self.journal.stop(task_id, str(detail.get("code", "authorization_denied")), 403)
             return
         self._require_authorized(response)
         if response.status_code == 200:
             self.journal.mark_reported(task_id)
+        elif response.status_code in {400, 403, 404, 409, 422, 428}:
+            detail = response.body.get("detail", {})
+            self.journal.stop(
+                task_id,
+                str(detail.get("code", "terminal_protocol_error")),
+                response.status_code,
+            )
 
     @staticmethod
     def _require_authorized(response: BusResponse) -> None:

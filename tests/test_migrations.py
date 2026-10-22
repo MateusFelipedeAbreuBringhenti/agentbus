@@ -33,8 +33,37 @@ def test_existing_version_one_database_receives_approval_migration(tmp_path):
         approvals_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'"
         ).fetchone()
-    assert versions == [(1,), (2,), (3,), (4,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,)]
     assert approvals_table == ("approvals",)
+
+
+def test_execution_provenance_migration_preserves_history_and_enforces_unique_ids(tmp_path):
+    path = tmp_path / "execution-provenance.sqlite3"
+    Database(path).migrate()
+    with sqlite3.connect(path) as connection:
+        task_id, _ = _insert_v2_task(connection)
+        historical = connection.execute(
+            """SELECT execution_id, runner_instance_id, execution_subject_id,
+                      claimed_principal_id, claim_policy_id, claim_policy_sha256
+               FROM tasks WHERE id = ?""",
+            (task_id,),
+        ).fetchone()
+        assert historical == (None, None, None, None, None, None)
+        values = (str(uuid4()), str(uuid4()), "dex", "dex-1", "policy-v1", "a" * 64)
+        connection.execute(
+            """UPDATE tasks SET execution_id=?, runner_instance_id=?,
+                      execution_subject_id=?, claimed_principal_id=?,
+                      claim_policy_id=?, claim_policy_sha256=? WHERE id=?""",
+            (*values, task_id),
+        )
+        second_id, _ = _insert_v2_task(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """UPDATE tasks SET execution_id=?, runner_instance_id=?,
+                          execution_subject_id=?, claimed_principal_id=?,
+                          claim_policy_id=?, claim_policy_sha256=? WHERE id=?""",
+                (*values, second_id),
+            )
 
 
 def _migrate_to_v2(path, monkeypatch):
@@ -107,7 +136,7 @@ def test_v2_to_v3_preserves_tasks_and_backfills_unambiguous_wait(tmp_path, monke
         )
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,)]
 
 
 def test_v2_to_v3_uses_only_open_pending_candidate_from_valid_history(

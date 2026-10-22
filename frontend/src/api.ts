@@ -37,7 +37,13 @@ function isTask(value: unknown): value is Task {
     && typeof value.created_at === "string"
     && typeof value.updated_at === "string"
     && isNullableString(value.started_at)
-    && isNullableString(value.finished_at);
+    && isNullableString(value.finished_at)
+    && isNullableString(value.execution_id)
+    && isNullableString(value.runner_instance_id)
+    && isNullableString(value.execution_subject_id)
+    && isNullableString(value.claimed_principal_id)
+    && isNullableString(value.claim_policy_id)
+    && isNullableString(value.claim_policy_sha256);
 }
 
 function isEvent(value: unknown): boolean {

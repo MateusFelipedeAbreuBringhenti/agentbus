@@ -245,7 +245,13 @@ class OperationalProjection:
             columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
             if not required.issubset(columns):
                 raise SourceIncompatible
-            return db.execute(f"SELECT {','.join(sorted(required))} FROM {table}").fetchall()
+            selected = set(required)
+            if source.kind == "runner":
+                selected.update(columns & {
+                    "stopped_at", "stop_code", "auth_required_at",
+                    "auth_error_code", "last_http_status",
+                })
+            return db.execute(f"SELECT {','.join(sorted(selected))} FROM {table}").fetchall()
 
     def _item(self, source: SourceConfig, row: sqlite3.Row) -> OperationalItem:
         data = dict(row)
@@ -284,7 +290,11 @@ class OperationalProjection:
             approval_id = None
             task, task_evidence = self.agentbus.get_task(task_id)
             correlation_id = task.get("correlation_id") if task else None
-            if data["claim_rejected_at"]:
+            if data.get("auth_required_at"):
+                state, attention, recovery, summary, observed = "auth_required", "authentication_required", "reauthenticate_same_subject", "Runner aguarda uma credencial válida do mesmo subject.", data["auth_required_at"]
+            elif data.get("stopped_at"):
+                state, attention, recovery, summary, observed = "stopped", "terminal_stopped", "human_intervention", "Runner interrompido por conflito terminal.", data["stopped_at"]
+            elif data["claim_rejected_at"]:
                 state, attention, recovery, summary, observed = "claim_rejected", "terminal_stopped", "none", "Outra instância venceu o claim.", data["claim_rejected_at"]
             elif data["reported_at"]:
                 state, attention, recovery, summary, observed = "reported", "terminal_success", "none", "Resultado confirmado pelo AgentBus.", data["reported_at"]
@@ -307,8 +317,11 @@ class OperationalProjection:
         quality = "exact" if observed else "unknown"
         if not correlation_id and source.kind in {"runner", "outbox"}:
             attention, summary = "insufficient_evidence", "Task canônica indisponível; correlação não comprovada."
-        error_code = data.get("last_error_code")
-        known_errors = {None, "transport_error", "authentication_required", "invalid_success_response", "gate_not_allowed", "invalid_authenticated_provenance", "task_not_waiting_on_approval", "credential_subject_changed", "credential_identity_or_permission_changed"}
+        error_code = (
+            data.get("last_error_code") or data.get("stop_code")
+            or data.get("auth_error_code")
+        )
+        known_errors = {None, "transport_error", "authentication_required", "invalid_credential", "invalid_success_response", "gate_not_allowed", "invalid_authenticated_provenance", "task_not_waiting_on_approval", "credential_subject_changed", "credential_identity_or_permission_changed", "task_state_conflict", "task_assignment_conflict", "task_type_not_allowed", "execution_id_conflict", "execution_instance_conflict", "execution_subject_conflict", "execution_provenance_required"}
         public_error = error_code if error_code in known_errors else "operation_error"
         return OperationalItem(
             operation_id=_operation_id(source.source_id, str(native)), source_id=source.source_id,

@@ -112,6 +112,39 @@ def test_runner_without_canonical_task_reports_insufficient_evidence(tmp_path):
     agentbus.close()
 
 
+def test_runner_auth_required_is_visible_without_exposing_command_material(tmp_path):
+    journal = tmp_path / "runner-auth.sqlite3"
+    with sqlite3.connect(journal) as db:
+        db.execute("""CREATE TABLE executions(task_id TEXT, runner_instance_id TEXT,
+            claimed_etag TEXT, claim_rejected_at TEXT, result_kind TEXT, reported_at TEXT,
+            created_at TEXT, updated_at TEXT, auth_required_at TEXT,
+            auth_error_code TEXT, last_http_status INTEGER, claim_key TEXT,
+            result_payload_json TEXT)""")
+        db.execute("INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            "task-auth", "runner-x", '"v2"', None, "succeeded", None,
+            "2026-10-20T00:00:00+00:00", "2026-10-20T00:02:00+00:00",
+            "2026-10-20T00:02:00+00:00", "invalid_credential", 401,
+            "secret-claim-key", '{"secret":"result"}',
+        ))
+    agentbus, app = _app(tmp_path, [{
+        "source_id": "runner", "kind": "runner", "path": str(journal),
+        "logical_owner": "dex",
+    }])
+    with TestClient(app) as client:
+        body = client.get(
+            "/operations", headers={"Authorization": f"Bearer {TOKEN}"},
+        ).json()
+        item = body["items"][0]
+        assert item["persisted_state"] == "auth_required"
+        assert item["attention_class"] == "insufficient_evidence"
+        assert item["recovery_mode"] == "reauthenticate_same_subject"
+        assert item["last_http_status"] == 401
+        serialized = json.dumps(body)
+        assert "secret-claim-key" not in serialized
+        assert '"secret":"result"' not in serialized
+    agentbus.close()
+
+
 def test_gateway_exposes_only_enumerated_operational_gets(tmp_path):
     journal = tmp_path / "intent.sqlite3"; _approval_journal(journal, rows=1)
     agentbus, projection_app = _app(tmp_path, [{"source_id": "intents", "kind": "approval_intent", "path": str(journal), "logical_owner": "human"}])
