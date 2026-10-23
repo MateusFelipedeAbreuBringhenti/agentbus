@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import fcntl
+import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 from threading import Event
@@ -110,6 +112,9 @@ class HttpAgentBusClient:
 
     def get_inbox(self, agent_id: str) -> BusResponse:
         return self._request("GET", f"/agents/{agent_id}/inbox")
+
+    def get_identity(self) -> BusResponse:
+        return self._request("GET", "/auth/me")
 
     def get_task(self, task_id: str) -> BusResponse:
         return self._request("GET", f"/tasks/{task_id}")
@@ -218,6 +223,27 @@ class DeterministicWorkExecutor:
         )
 
 
+class DeterministicNoopExecutor:
+    """Closed E2E executor with no shell, network, or filesystem effects."""
+
+    task_type = "palace.e2e.noop"
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        if request.task_type != self.task_type:
+            return ExecutionFailed(
+                failure_code="noop_task_type_not_allowed",
+                failure_message="The deterministic noop executor rejects this Task type.",
+            )
+        canonical_input = json.dumps(
+            request.input, separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")
+        return ExecutionSucceeded(output={
+            "status": "verified",
+            "input_sha256": hashlib.sha256(canonical_input).hexdigest(),
+            "execution_id": str(request.execution_id),
+        })
+
+
 @dataclass(frozen=True)
 class JournalRecord:
     task_id: str
@@ -246,7 +272,10 @@ class RunnerJournal:
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_file = open(f"{self.path}.lock", "a+b")
+        self._ensure_private_file(self.path)
+        lock_path = Path(f"{self.path}.lock")
+        self._ensure_private_file(lock_path)
+        self._lock_file = lock_path.open("a+b")
         try:
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -256,6 +285,16 @@ class RunnerJournal:
         self._connection.row_factory = sqlite3.Row
         self._create_schema()
         self.runner_instance_id = self._load_or_create_identity(runner_instance_id)
+
+    @staticmethod
+    def _ensure_private_file(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if path.stat().st_mode & 0o077:
+                raise PermissionError(f"Runner private file has unsafe permissions: {path}") from None
+        else:
+            os.close(descriptor)
 
     def close(self) -> None:
         self._connection.close()
