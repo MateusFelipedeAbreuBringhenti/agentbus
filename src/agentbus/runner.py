@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 from threading import Event
 import time
 from typing import Any, Literal, Protocol
@@ -274,8 +275,7 @@ class RunnerJournal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_private_file(self.path)
         lock_path = Path(f"{self.path}.lock")
-        self._ensure_private_file(lock_path)
-        self._lock_file = lock_path.open("a+b")
+        self._lock_file = self._open_private_file(lock_path)
         try:
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -288,13 +288,34 @@ class RunnerJournal:
 
     @staticmethod
     def _ensure_private_file(path: Path) -> None:
+        descriptor = RunnerJournal._open_private_descriptor(path)
         try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            if path.stat().st_mode & 0o077:
-                raise PermissionError(f"Runner private file has unsafe permissions: {path}") from None
-        else:
+            opened = os.fstat(descriptor)
+            current = path.lstat()
+            if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                raise PermissionError(f"Runner private file changed while opening: {path}")
+        finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _open_private_descriptor(path: Path) -> int:
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as error:
+            raise PermissionError(f"Runner private file cannot be opened safely: {path}") from error
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_mode & 0o077:
+            os.close(descriptor)
+            raise PermissionError(f"Runner private file has unsafe type or permissions: {path}")
+        return descriptor
+
+    @staticmethod
+    def _open_private_file(path: Path):
+        descriptor = RunnerJournal._open_private_descriptor(path)
+        return open(descriptor, "a+b", closefd=True)
 
     def close(self) -> None:
         self._connection.close()

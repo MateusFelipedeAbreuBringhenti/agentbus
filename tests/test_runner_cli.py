@@ -75,6 +75,23 @@ def test_runner_cli_rejects_relative_private_paths(tmp_path):
     assert stopped.value.code == 2
 
 
+def test_runner_journal_rejects_symlink_for_database_and_lock(tmp_path):
+    from agentbus.runner import RunnerJournal
+
+    target = tmp_path / "target"
+    target.touch(mode=0o600)
+    database_link = tmp_path / "database.sqlite3"
+    database_link.symlink_to(target)
+    with pytest.raises(PermissionError):
+        RunnerJournal(database_link)
+
+    journal_path = tmp_path / "runner.sqlite3"
+    lock_link = tmp_path / "runner.sqlite3.lock"
+    lock_link.symlink_to(target)
+    with pytest.raises(PermissionError):
+        RunnerJournal(journal_path)
+
+
 def test_runner_cli_fails_before_polling_when_subject_differs(tmp_path, monkeypatch):
     class WrongSubjectClient(FakeClient):
         def get_identity(self):

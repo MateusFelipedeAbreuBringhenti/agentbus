@@ -36,9 +36,12 @@ efeitos externos.
 
 - `tests/test_e2e_operational_readiness.py` atravessa os contratos reais em
   processo, sem editar SQLite ou chamar serviços de domínio diretamente.
-- `tests/test_control_center_proxy_live.py` sobe AgentBus, gateway, intent
-  service e Vite em portas dinâmicas; quando Chromium está disponível, renderiza
-  a página real em modo headless e verifica dados persistidos.
+- `tests/test_operational_smoke_live.py` sobe AgentBus, gateway, intent service,
+  projeção e Vite em portas dinâmicas. Confirmação, release e Runner são processos
+  separados; o Runner usa o CLI publicado. Chromium é obrigatório e observa a
+  mesma Task concluída, seu trace e os quatro journals.
+- `tests/test_control_center_proxy_live.py` preserva a prova menor do caminho
+  Vite → gateway → AgentBus.
 - os testes unitários existentes de UI continuam sendo testes de renderização
   com respostas simuladas e não são apresentados como E2E.
 
