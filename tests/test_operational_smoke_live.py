@@ -3,16 +3,24 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 
 from agentbus.approval_intents import ApprovalIntentJournal
 from agentbus.auth import token_digest
 from agentbus.coordinator import CoordinatorOutbox
+from agentbus.orion_ops import (
+    CreateSuccessorInput,
+    CreateTaskInput,
+    HttpControlTransport,
+    OrionOpsControlPlane,
+    RequestApprovalInput,
+)
 from agentbus.release_reconciler import ReleaseJournal
 from agentbus.runner import RunnerJournal
 
@@ -87,7 +95,8 @@ def test_real_processes_cli_runner_and_browser_observe_one_completed_task(tmp_pa
 
     definitions = [
         ("coordinator-1", SUBJECT, "coordinator", [
-            "task:create", "approval:request", "task:release", "task:read:any",
+            "task:create", "task:create:successor", "approval:request",
+            "task:release", "task:read:any",
             "approval:read:any", "event:read:any", "trace:read:any",
         ]),
         ("approver-1", "mateus-e2e", "approver", [
@@ -175,23 +184,60 @@ def test_real_processes_cli_runner_and_browser_observe_one_completed_task(tmp_pa
             ROOT / "frontend"))
         _wait_for(f"http://127.0.0.1:{vite_port}/")
 
-        correlation_id = str(uuid4())
-        task_response = httpx.post(f"{bus_url}/tasks", json={
-            "type": "palace.e2e.noop", "title": "Palace live operational test drive",
-            "input": {"message": "Palace operational readiness", "expected_result": "verified"},
-            "requested_by": SUBJECT, "assigned_to": "dex-e2e",
-            "correlation_id": correlation_id,
-        }, headers=_headers("coordinator", **{"Idempotency-Key": "live-create"}))
-        assert task_response.status_code == 201
-        task = task_response.json()
-        requested = httpx.post(f"{bus_url}/tasks/{task['id']}/request-approval", json={
-            "gate": "palace.e2e.manual", "request_reason": "Live human boundary",
-            "requested_by": SUBJECT, "assigned_to": "mateus-e2e", "context": {},
-        }, headers=_headers("coordinator", **{
-            "Idempotency-Key": "live-request", "If-Match": task_response.headers["etag"],
-        }))
-        assert requested.status_code == 200
-        approval = requested.json()["approval"]
+        correlation_id = uuid4()
+        coordinator_transport = HttpControlTransport(
+            bus_url, token=TOKENS["coordinator"], subject_id=SUBJECT,
+        )
+        try:
+            coordinator = OrionOpsControlPlane(
+                coordinator_transport,
+                instance_id=UUID("11111111-1111-4111-8111-111111111111"),
+                outbox=CoordinatorOutbox(outbox_journal),
+            )
+            seed = coordinator.create_task(CreateTaskInput(
+                type="palace.e2e.noop", title="Palace live test-drive seed",
+                input={"purpose": "causal predecessor only"}, assigned_to="dex-e2e",
+                correlation_id=correlation_id, idempotency_key="live-seed-create",
+            ))
+
+            seed_run = subprocess.run([
+                sys.executable, "-m", "agentbus.runner_cli", "run",
+                "--agent-id", "dex-e2e", "--journal", str(runner_journal),
+                "--token-file", str(token_files["runner"]),
+                "--executor", "deterministic-noop",
+                "--allow-task-type", "palace.e2e.noop", "--agentbus-url", bus_url,
+                "--once",
+            ], cwd=ROOT, env=base_env, capture_output=True, text=True, timeout=20)
+            assert seed_run.returncode == 0, seed_run.stderr
+
+            coordination_id = uuid4()
+            task_result = coordinator.create_successor_task(CreateSuccessorInput(
+                coordination_id=coordination_id, predecessor_task_id=UUID(seed.data["id"]),
+                type="palace.e2e.noop", title="Palace live operational test drive",
+                input={"message": "Palace operational readiness", "expected_result": "verified"},
+                assigned_to="dex-e2e",
+            ))
+            task = task_result.data
+            requested = coordinator.request_approval(RequestApprovalInput(
+                task_id=UUID(task["id"]), gate="palace.e2e.manual",
+                request_reason="Live human boundary", assigned_to="mateus-e2e",
+                if_match=task_result.http.etag,
+                idempotency_key="live-request",
+            ))
+            approval = requested.data["approval"]
+            approval_etag = requested.http.approval_etag
+        finally:
+            coordinator_transport.close()
+
+        with sqlite3.connect(outbox_journal) as outbox_db:
+            persisted_successor = outbox_db.execute(
+                "SELECT predecessor_task_id, successor_task_id, confirmed_at "
+                "FROM successor_commands WHERE coordination_id = ?",
+                (str(coordination_id),),
+            ).fetchone()
+        assert persisted_successor is not None
+        assert persisted_successor[:2] == (seed.data["id"], task["id"])
+        assert persisted_successor[2] is not None
 
         with httpx.Client(base_url=f"http://127.0.0.1:{vite_port}") as browser_http:
             boundary = {"Origin": f"http://127.0.0.1:{vite_port}", "Sec-Fetch-Site": "same-origin"}
@@ -199,7 +245,7 @@ def test_real_processes_cli_runner_and_browser_observe_one_completed_task(tmp_pa
             intent = browser_http.post("/intent-api/approval-intents", json={
                 "approval_id": approval["id"], "decision": "approve",
                 "decision_reason": "Automated isolated identity",
-                "if_match": requested.headers["approval-etag"],
+                "if_match": approval_etag,
             }, headers={**boundary, "Intent-Key": "live-intent",
                         "X-AgentBus-CSRF": session["csrf_token"]})
         assert intent.status_code == 201

@@ -7,7 +7,8 @@ políticas e journals pertencem a um diretório temporário isolado.
 ## Fluxo comprovado
 
 ```text
-Orion-ops cria Task e solicita Approval
+Orion-ops conclui uma semente NOOP e cria a Task como sucessora pelo outbox
+→ Orion-ops solicita Approval para a sucessora
 → navegador registra intenção sem autoridade
 → aprovador confirma em processo separado
 → reconciliador libera com causalidade autenticada
@@ -37,9 +38,10 @@ efeitos externos.
 - `tests/test_e2e_operational_readiness.py` atravessa os contratos reais em
   processo, sem editar SQLite ou chamar serviços de domínio diretamente.
 - `tests/test_operational_smoke_live.py` sobe AgentBus, gateway, intent service,
-  projeção e Vite em portas dinâmicas. Confirmação, release e Runner são processos
-  separados; o Runner usa o CLI publicado. Chromium é obrigatório e observa a
-  mesma Task concluída, seu trace e os quatro journals.
+  projeção e Vite em portas dinâmicas. Orion-ops usa transporte HTTP real e
+  persiste a criação causal da sucessora no outbox. Confirmação, release e Runner
+  são processos separados; o Runner usa o CLI publicado. Chromium é obrigatório
+  e observa a mesma Task concluída, seu trace e os quatro journals.
 - `tests/test_control_center_proxy_live.py` preserva a prova menor do caminho
   Vite → gateway → AgentBus.
 - os testes unitários existentes de UI continuam sendo testes de renderização
