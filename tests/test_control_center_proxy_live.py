@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import shutil
 import time
 from uuid import uuid4
 
@@ -137,6 +138,15 @@ def test_browser_vite_gateway_agentbus_path_preserves_api_prefix(tmp_path):
         )
         assert response.status_code == 200
         assert [item["id"] for item in response.json()["items"]] == [created.json()["id"]]
+        chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+        if chromium is not None:
+            rendered = subprocess.run([
+                chromium, "--headless", "--disable-gpu", "--no-sandbox",
+                "--virtual-time-budget=3000",
+                "--dump-dom", f"http://127.0.0.1:{vite_port}/tasks",
+            ], check=True, capture_output=True, text=True, timeout=30)
+            assert "Visible through Vite" in rendered.stdout
+            assert "Gerenciamento de Tarefas" in rendered.stdout
         intent_session = httpx.get(
             f"http://127.0.0.1:{vite_port}/intent-api/session",
             headers={

@@ -21,6 +21,7 @@ agentbus-orion-ops-mcp = "agentbus.orion_ops_mcp:main"
 agentbus-auth = "agentbus.auth_cli:main"
 agentbus-approval-confirm = "agentbus.approval_confirm:main"
 agentbus-release-reconcile = "agentbus.release_reconciler:main"
+agentbus-runner = "agentbus.runner_cli:main"
 
 [project.optional-dependencies]
 test = [

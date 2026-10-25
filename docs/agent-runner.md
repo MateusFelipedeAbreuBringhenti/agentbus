@@ -74,6 +74,28 @@ chamado novamente.
 `DeterministicWorkExecutor` existe apenas para demonstrar o protocolo. Ele não
 usa modelo ou fornecedor externo.
 
+## Launcher operacional fechado
+
+O comando `agentbus-runner` inicia somente o executor E2E inofensivo. Ele valida
+o subject e as permissões pelo `/auth/me` antes de abrir o journal ou consultar
+a inbox. A allowlist precisa conter exatamente `palace.e2e.noop`; não existe
+import dinâmico, shell ou executor escolhido pela Task.
+
+```text
+agentbus-runner run \
+  --agent-id dex-e2e \
+  --journal /absolute/private/runner.sqlite3 \
+  --token-file /absolute/private/dex-e2e.token \
+  --executor deterministic-noop \
+  --allow-task-type palace.e2e.noop \
+  --agentbus-url http://127.0.0.1:8000 \
+  --once
+```
+
+Sem `--once`, o processo faz polling até receber `SIGINT` ou `SIGTERM`. O sinal
+interrompe entre ciclos e preserva o journal. O launcher aceita somente AgentBus
+HTTP em loopback e arquivos privados por caminhos absolutos.
+
 ## Limites
 
 O runner não decide Approvals, não adota Tasks órfãs, não implementa lease,

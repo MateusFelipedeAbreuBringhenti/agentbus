@@ -22,6 +22,7 @@ from agentbus.runner import (
     AgentRunner,
     BusResponse,
     DeterministicWorkExecutor,
+    DeterministicNoopExecutor,
     ExecutionRequest,
     ExecutionSucceeded,
     JournalLockedError,
@@ -35,6 +36,25 @@ class UnauthorizedBusClient:
 
     def get_inbox(self, agent_id):
         return BusResponse(401, {"detail": {"code": "invalid_credential"}}, {})
+
+
+def test_deterministic_noop_is_closed_and_has_no_command_interpreter():
+    request = ExecutionRequest(
+        execution_id=uuid4(), task_id=uuid4(), task_type="palace.e2e.noop",
+        title="Safe test drive", description=None,
+        input={"command": "sudo anything", "message": "ignored as data"},
+        correlation_id=uuid4(), task_etag='"v2"', agent_id="dex-e2e",
+    )
+    result = DeterministicNoopExecutor().execute(request)
+    assert isinstance(result, ExecutionSucceeded)
+    assert result.output["status"] == "verified"
+    assert result.output["execution_id"] == str(request.execution_id)
+    assert set(result.output) == {"status", "input_sha256", "execution_id"}
+
+    denied = DeterministicNoopExecutor().execute(
+        ExecutionRequest(**{**request.__dict__, "task_type": "shell.command"})
+    )
+    assert denied.failure_code == "noop_task_type_not_allowed"
 
 
 class TestAgentBusClient:
