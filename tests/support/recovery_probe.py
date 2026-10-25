@@ -10,19 +10,16 @@ from threading import Event
 from uuid import UUID
 
 from agentbus.runner import (
+    AgentBusTransportError,
     AgentRunner,
-    BusResponse,
     ExecutionRequest,
     ExecutionSucceeded,
+    HttpAgentBusClient,
     RunnerJournal,
 )
 
 
 AGENT_ID = "dex-recovery"
-TASK_ID = "11111111-1111-4111-8111-111111111111"
-CORRELATION_ID = "22222222-2222-4222-8222-222222222222"
-
-
 def emit(checkpoint: str, **fields: str) -> None:
     print(json.dumps({"checkpoint": checkpoint, **fields}, sort_keys=True), flush=True)
 
@@ -56,73 +53,68 @@ class ProbeExecutor:
         })
 
 
-class ProbeClient:
-    authenticated_subject_id = AGENT_ID
-
-    def __init__(self, *, block_before_report: bool) -> None:
+class BlockingReportClient:
+    def __init__(
+        self, client: HttpAgentBusClient, *, block_before_report: bool,
+        drop_terminal_response: bool,
+    ) -> None:
+        self.client = client
         self.block_before_report = block_before_report
+        self.drop_terminal_response = drop_terminal_response
+        self.authenticated_subject_id = client.authenticated_subject_id
 
-    def get_inbox(self, agent_id: str) -> BusResponse:
-        assert agent_id == AGENT_ID
-        return BusResponse(200, {"items": [{
-            "kind": "task",
-            "task": {"id": TASK_ID, "status": "ready", "type": "palace.recovery.probe"},
-        }]}, {})
+    def __getattr__(self, name: str):
+        return getattr(self.client, name)
 
-    def claim_task(
-        self, task_id: str, agent_id: str, idempotency_key: str,
-        execution_id: str, runner_instance_id: str,
-    ) -> BusResponse:
-        return BusResponse(200, {}, {"etag": '"v2"'})
-
-    def get_task(self, task_id: str) -> BusResponse:
-        return BusResponse(200, {
-            "id": TASK_ID,
-            "status": "running",
-            "type": "palace.recovery.probe",
-            "title": "Controlled recovery probe",
-            "description": None,
-            "input": {},
-            "correlation_id": CORRELATION_ID,
-        }, {"etag": '"v2"'})
-
-    def complete_task(
-        self, task_id: str, output: dict, idempotency_key: str, if_match: str,
-        execution_id: str, runner_instance_id: str,
-    ) -> BusResponse:
+    def complete_task(self, *args, **kwargs):
+        execution_id = kwargs.get("execution_id") or args[4]
         if self.block_before_report:
-            emit("result_durable_before_report", execution_id=execution_id)
+            emit("result_durable_before_report", execution_id=str(execution_id))
             Event().wait()
-        return BusResponse(200, {"id": task_id, "status": "succeeded"}, {"etag": '"v3"'})
-
-    def fail_task(self, *args, **kwargs) -> BusResponse:
-        raise AssertionError("The recovery probe never fails its synthetic Task.")
+        response = self.client.complete_task(*args, **kwargs)
+        if self.drop_terminal_response:
+            emit("upstream_terminal_confirmed", execution_id=str(execution_id))
+            raise AgentBusTransportError("test harness discarded confirmed response")
+        return response
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--journal", required=True, type=Path)
     parser.add_argument("--ledger", required=True, type=Path)
+    parser.add_argument("--agentbus-url", required=True)
+    parser.add_argument("--token", required=True)
+    parser.add_argument("--task-id", required=True)
     parser.add_argument(
         "--mode", required=True,
-        choices=("block-after-effect", "block-before-report", "finish"),
+        choices=("block-after-effect", "block-before-report", "drop-terminal", "finish"),
     )
     arguments = parser.parse_args()
-    with RunnerJournal(arguments.journal) as journal:
-        runner = AgentRunner(
-            agent_id=AGENT_ID,
-            client=ProbeClient(block_before_report=arguments.mode == "block-before-report"),
-            journal=journal,
-            executor=ProbeExecutor(
-                arguments.ledger,
-                block_after_effect=arguments.mode == "block-after-effect",
-            ),
-            allowed_task_types=frozenset({"palace.recovery.probe"}),
-        )
-        runner.poll_once()
-        record = journal.get(TASK_ID)
-        assert record is not None
-        emit("finished", execution_id=record.execution_id)
+    http_client = HttpAgentBusClient(
+        arguments.agentbus_url, token=arguments.token, subject_id=AGENT_ID,
+    )
+    try:
+        with RunnerJournal(arguments.journal) as journal:
+            runner = AgentRunner(
+                agent_id=AGENT_ID,
+                client=BlockingReportClient(
+                    http_client,
+                    block_before_report=arguments.mode == "block-before-report",
+                    drop_terminal_response=arguments.mode == "drop-terminal",
+                ),
+                journal=journal,
+                executor=ProbeExecutor(
+                    arguments.ledger,
+                    block_after_effect=arguments.mode == "block-after-effect",
+                ),
+                allowed_task_types=frozenset({"palace.recovery.probe"}),
+            )
+            runner.poll_once()
+            record = journal.get(arguments.task_id)
+            assert record is not None
+            emit("finished", execution_id=record.execution_id)
+    finally:
+        http_client.close()
 
 
 if __name__ == "__main__":
