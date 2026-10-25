@@ -47,6 +47,11 @@ an arbitrary external system accepted an effect before a process crash.
 
 H3 discards the response in the test adapter only after the HTTP client has
 received the upstream response; it is not an independent network fault proxy.
+H5 obtains its `401` from the real loopback AgentBus, rejects recovery by a
+different authenticated subject, and then recovers the unchanged command with
+a rotated principal for the original subject. H7 captures the canonical
+successor before recovery, verifies that the outbox records that same Task id,
+and proves that the successor has exactly one `task.created` Event.
 H6 reuses the already confirmed and persisted decision without another human
 prompt. H8 proves observational recovery only and performs no canonical-state
 mutation.

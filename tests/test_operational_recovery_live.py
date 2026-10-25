@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import multiprocessing
 import selectors
+import shutil
 import sqlite3
 import socket
 import subprocess
@@ -25,7 +26,8 @@ from agentbus.orion_ops import (
     CreateSuccessorInput, HttpControlTransport, OrionOpsControlPlane,
 )
 from agentbus.release_reconciler import (
-    AgentBusReleaseClient, ReleaseJournal, ReleasePolicy, ReleaseReconciler,
+    AgentBusReleaseClient, ReconciliationStopped, ReleaseJournal, ReleasePolicy,
+    ReleaseReconciler,
 )
 from agentbus.runner import RunnerJournal
 
@@ -41,6 +43,7 @@ COORD_INSTANCE = "33333333-3333-4333-8333-333333333333"
 COORD_SUBJECT = f"local-coordinator:{COORD_INSTANCE}"
 PROJECTION_TOKEN = "recovery-projection-token-000000000000000"
 READER_TOKEN = "recovery-reader-token-00000000000000000000"
+OTHER_SUBJECT_TOKEN = "recovery-other-subject-token-000000000000000"
 
 
 def _free_port() -> int:
@@ -77,7 +80,8 @@ def live_agentbus(tmp_path):
             "principal_id": "coordinator-old", "subject_id": COORD_SUBJECT,
             "token_sha256": token_digest(COORD_TOKEN),
             "permissions": ["task:create", "task:create:successor", "approval:request", "task:release",
-                            "task:read:any", "approval:read:any", "event:read:any"],
+                            "task:read:any", "approval:read:any", "event:read:any",
+                            "trace:read:any"],
         },
         {
             "principal_id": "projection", "subject_id": "recovery-projection",
@@ -87,6 +91,12 @@ def live_agentbus(tmp_path):
         {
             "principal_id": "coordinator-rotated", "subject_id": COORD_SUBJECT,
             "token_sha256": token_digest(ROTATED_TOKEN),
+            "permissions": ["task:release", "task:read:any", "approval:read:any",
+                            "event:read:any"],
+        },
+        {
+            "principal_id": "other-coordinator", "subject_id": "local-coordinator:other",
+            "token_sha256": token_digest(OTHER_SUBJECT_TOKEN),
             "permissions": ["task:release", "task:read:any", "approval:read:any",
                             "event:read:any"],
         },
@@ -187,13 +197,21 @@ def _release_child(url: str, journal: str, policy: str, approval_id: str, send) 
         client.close()
 
 
-class _UnauthorizedReleaseClient(AgentBusReleaseClient):
+class _RevokedDuringReleaseClient(AgentBusReleaseClient):
     def release(self, row):
-        return httpx.Response(401, json={"detail": {"code": "invalid_credential"}})
+        return httpx.post(
+            f"{self.client.base_url}/tasks/{row['task_id']}/release",
+            json=json.loads(row["command_body_json"]),
+            headers={
+                "Authorization": "Bearer revoked-recovery-token",
+                "Idempotency-Key": row["idempotency_key"],
+                "If-Match": row["task_etag"],
+            },
+        )
 
 
 def _auth_required_child(url: str, journal: str, policy: str, approval_id: str) -> None:
-    client = _UnauthorizedReleaseClient(url, COORD_TOKEN)
+    client = _RevokedDuringReleaseClient(url, COORD_TOKEN)
     try:
         try:
             ReleaseReconciler(
@@ -490,7 +508,26 @@ def test_h5_auth_required_process_recovers_with_new_principal_same_subject(
         _kill_owned(process)
     suspended = ReleaseJournal(journal).read(approval["id"])
     assert suspended["state"] == "auth_required"
+    assert suspended["last_http_status"] == 401
+    assert suspended["last_error_code"] == "authentication_required"
     exact = (suspended["command_body_json"], suspended["idempotency_key"])
+
+    adversarial_journal = tmp_path / "release-h5-other-subject.sqlite3"
+    shutil.copy2(journal, adversarial_journal)
+    other_client = AgentBusReleaseClient(url, OTHER_SUBJECT_TOKEN)
+    try:
+        with pytest.raises(ReconciliationStopped):
+            ReleaseReconciler(
+                journal=ReleaseJournal(adversarial_journal), client=other_client,
+                policy=ReleasePolicy.from_file(policy),
+                expected_subject_id=COORD_SUBJECT,
+            ).recover()
+    finally:
+        other_client.close()
+    rejected = ReleaseJournal(adversarial_journal).read(approval["id"])
+    assert rejected["state"] == "stopped"
+    assert rejected["last_error_code"] == "credential_identity_or_permission_changed"
+
     client = AgentBusReleaseClient(url, ROTATED_TOKEN)
     try:
         ReleaseReconciler(
@@ -561,6 +598,19 @@ def test_h7_orion_ops_process_crash_recovers_same_successor(tmp_path, live_agent
         _kill_owned(process)
     pending = CoordinatorOutbox(journal).pending()
     assert len(pending) == 1 and pending[0].successor_task_id is None
+    predecessor = httpx.get(
+        f"{url}/tasks/{predecessor_id}", headers=_auth(COORD_TOKEN),
+    ).json()
+    trace_before = httpx.get(
+        f"{url}/correlations/{predecessor['correlation_id']}/trace",
+        headers=_auth(COORD_TOKEN),
+    )
+    assert trace_before.status_code == 200
+    canonical_successors = [
+        task for task in trace_before.json()["tasks"] if task["id"] != predecessor_id
+    ]
+    assert len(canonical_successors) == 1
+    canonical_successor_id = canonical_successors[0]["id"]
     transport = HttpControlTransport(url, token=COORD_TOKEN, subject_id=COORD_SUBJECT)
     try:
         recovered = OrionOpsControlPlane(
@@ -572,6 +622,16 @@ def test_h7_orion_ops_process_crash_recovers_same_successor(tmp_path, live_agent
     assert len(recovered) == 1
     assert recovered[0].http.idempotency_replayed == "true"
     assert CoordinatorOutbox(journal).pending() == []
+    with sqlite3.connect(journal) as connection:
+        persisted_successor_id = connection.execute(
+            "SELECT successor_task_id FROM successor_commands",
+        ).fetchone()[0]
+    assert persisted_successor_id == canonical_successor_id
+    successor_events = httpx.get(
+        f"{url}/tasks/{canonical_successor_id}/events", headers=_auth(COORD_TOKEN),
+    )
+    assert successor_events.status_code == 200
+    assert [event["type"] for event in successor_events.json()].count("task.created") == 1
 
 
 def test_h8_projection_process_recovers_isolated_source_without_mutation(
