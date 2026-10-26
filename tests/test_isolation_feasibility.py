@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from uuid import uuid4
 
 import pytest
 
@@ -108,26 +109,52 @@ def test_user_systemd_enforces_memory_limit_on_child_process() -> None:
     systemd_run = shutil.which("systemd-run")
     if systemd_run is None:
         pytest.fail("systemd-run is required for the isolation feasibility gate")
-    result = subprocess.run(
-        [
-            systemd_run,
-            "--user",
-            "--scope",
-            "--quiet",
-            "--property=MemoryMax=64M",
-            "--property=TasksMax=16",
-            "/usr/bin/sh",
-            "-c",
-            "/usr/bin/python3 -c 'bytearray(256 * 1024 * 1024)'",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert result.returncode != 0
+    unit = f"agentbus-c0-{uuid4().hex}.scope"
+    try:
+        result = subprocess.run(
+            [
+                systemd_run,
+                "--user",
+                "--scope",
+                f"--unit={unit.removesuffix('.scope')}",
+                "--quiet",
+                "--property=MemoryMax=64M",
+                "--property=TasksMax=16",
+                "/usr/bin/sh",
+                "-c",
+                "/usr/bin/python3 -c 'bytearray(256 * 1024 * 1024)'",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        properties = subprocess.run(
+            [
+                "systemctl", "--user", "show", unit,
+                "--property=Result", "--property=MemoryPeak",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        observed = dict(
+            line.split("=", 1)
+            for line in properties.stdout.splitlines()
+            if "=" in line
+        )
+        assert result.returncode != 0
+        assert observed["Result"] == "oom-kill"
+        assert 0 < int(observed["MemoryPeak"]) <= 64 * 1024 * 1024
+    finally:
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", unit],
+            capture_output=True,
+            timeout=10,
+        )
 
 
-def test_codex_sdk_0158_has_no_external_tool_executor_boundary() -> None:
+def test_codex_sdk_0158_public_client_exposes_no_observed_tool_executor_boundary() -> None:
     from openai_codex.client import CodexClient, CodexConfig
 
     parameters = inspect.signature(CodexClient).parameters
