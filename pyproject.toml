@@ -36,5 +36,6 @@ addopts = "-q"
 pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
+    "isolation: opt-in host isolation feasibility probe",
     "live: opt-in test that consumes the authenticated Codex plan allowance",
 ]
